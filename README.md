@@ -15,10 +15,20 @@ This is a mod created for the game "Vintage Story".
 This mod targets an issue with food in Vintage Story multiplayer. In the base game, if a player leaves food in a container and then leaves the server, it will gradually spoil over time. Players that spend large amounts of time on servers can negatively affect other player's experience as by the time they log back on, everything they have will be turned into rot.
 
 ### How it works
-Containers blocks have custom behavior attached to them that tracks who placed the block, as well as who last opened it. If the owner of the block is offline, the "transition" rate for that container will be changed to 0.
+Containers blocks have custom behavior attached to them that tracks who interacts with it, separating players into 2 categories:
+- **residents**: Players who own this container and interact with it often, probably members of the same household.
+- **provisional**: Players who interact with container just once, adding/removing items from it. 
 
-If a player interacts with this container, the food in it will act like the owner never went offline and spoil like normal until that player leaves, or the owner comes back online and interacts with the chest. This is done to avoid players abusing this mechanic.
+Both types cause food to spoil if ANY of them is online, but provisional players are removed from the tracking system after much shorter period of time.  
+There always must be at least one resident added to the container, other residents can also "expiry" if they don't interact with the container for a long time, especially if they are far away from it.  
 
+All these values are configurable. Including the spoil rate when players are offline - currently default is 0.05.
+
+This system still could be abused if one of players just on purpose never interacts with the container, maybe this can be improved in the future by automatically adding players who are close to container frequently.  
+But by keeping the list of all players who take/put items in/out of the container I think this is a good compromise to keep the system simple for most cases.  
+This current system (by GotoFinal) was mostly designed for servers with few small groups that might play in different times of the day, so abuse prevention was not a big concern.
+
+There is also `/spoildebug` command that can be used to see players added to the storage and even add/remove them manually.
 ---
 
 ### Credit

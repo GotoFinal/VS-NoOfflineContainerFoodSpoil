@@ -1,4 +1,4 @@
-﻿using Newtonsoft.Json;
+using Newtonsoft.Json;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -12,420 +12,714 @@ namespace NoOfflineContainerFoodSpoil
 {
     public class NoOfflineContainerFoodSpoilModSystem : ModSystem
     {
-        // Dictionary stores who is online, as well as what containers are loaded into memory.
-        public Dictionary<string, IServerPlayer> OnlinePlayers = new Dictionary<string, IServerPlayer>();
-        public HashSet<BlockEntityBehaviorOfflinePreserve> LoadedContainers = new();
+        private const string ConfigFileName = "NoOfflineContainerFoodSpoil.json";
 
-        // A data structure that is used to track how long a player has been offline. This is attached to each player's custom attributes in players.json
-        public class OfflineHours
-        {
-            [JsonProperty("total_offline_hours")]
-            public double TotalOfflineHours;
-            [JsonProperty("last_logout_timestamp")]
-            public double LastLogoutTimestamp;
-        }
+        // this feels risky, maybe some soft reference would be worth it? But maybe unsubscribe is good enough
+        public HashSet<BlockEntityBehaviorOfflinePreserve> LoadedContainers { get; } = [];
+        public NoOfflineContainerFoodSpoilConfig Config { get; private set; } = NoOfflineContainerFoodSpoilConfig.CreateDefault();
+        internal ICoreServerAPI? ServerApi { get; private set; }
 
-        // Registers the custom Block Entity Behavior class on both the client and server when the world is started.
         public override void Start(ICoreAPI api)
         {
             base.Start(api);
-
             api.RegisterBlockEntityBehaviorClass("OfflinePreserve", typeof(BlockEntityBehaviorOfflinePreserve));
         }
 
-        // Server-side only start logic
         public override void StartServerSide(ICoreServerAPI api)
         {
             base.StartServerSide(api);
 
-            api.Event.DidPlaceBlock += (player, oldId, blockSel, stack) =>
-            {
-                var blockEntity = api.World.BlockAccessor.GetBlockEntity(blockSel.Position);
-                var blockEntityBehavior = blockEntity?.GetBehavior<BlockEntityBehaviorOfflinePreserve>();
-
-                if (blockEntityBehavior != null && blockEntity != null)
-                {
-                    blockEntityBehavior.OwnerUID = player.PlayerUID; // Set the owner of the block to whoever placed it.
-
-                    // Logic called to fetch the player's offline hours and to deserialize the data.
-                    player.ServerData.CustomPlayerData.TryGetValue("NoOfflineFoodSpoil", out string? json);
-                    OfflineHours data;
-                    try
-                    {
-                        if (string.IsNullOrEmpty(json)) data = new OfflineHours();
-                        else data = JsonConvert.DeserializeObject<OfflineHours>(json) ?? new OfflineHours();
-                    }
-                    catch (Exception ex)
-                    {
-                        api.Logger.Error($"[NoOfflineFoodSpoil] Failed to deserialize offline hours for player. Resetting to 0. Error: {ex.Message}");
-                        data = new OfflineHours();
-                    }
-                    blockEntityBehavior.LastKnownOwnerOfflineHours = data.TotalOfflineHours; // Stores last known owner's "offlinehours" in the block when it is placed. 
-
-                    Mod.Logger.Notification($"Container block placed at {blockEntity?.Pos}. Owner set to {player.PlayerName} <{player.PlayerUID}>.");
-                    blockEntity?.MarkDirty(true);
-                }
-            };
-
-            api.Event.PlayerJoin += byPlayer =>
-            {
-                var playerOfflineHoursData = byPlayer.ServerData.CustomPlayerData;
-                string modKey = "NoOfflineFoodSpoil";
-
-                playerOfflineHoursData.TryGetValue(modKey, out string? json);
-
-                // Logic called to fetch the player's offline hours and to deserialize the data.
-                OfflineHours data;
-                try
-                {
-                    if (string.IsNullOrEmpty(json)) data = new OfflineHours();
-                    else data = JsonConvert.DeserializeObject<OfflineHours>(json) ?? new OfflineHours();
-                }
-                catch (Exception ex)
-                {
-                    api.Logger.Error($"[NoOfflineFoodSpoil] Failed to deserialize offline hours for player. Resetting to 0. Error: {ex.Message}");
-                    data = new OfflineHours();
-                }
-
-                if (data.LastLogoutTimestamp > 0)
-                {
-                    double sessionOfflineDuration = Math.Max(0, api.World.Calendar.TotalHours - data.LastLogoutTimestamp);
-                    data.TotalOfflineHours += sessionOfflineDuration; // Adds however long the player has been offline to their offlinehours counter.
-                    data.LastLogoutTimestamp = 0;
-                }
-
-                playerOfflineHoursData[modKey] = JsonConvert.SerializeObject(data);
-
-                OnlinePlayers[byPlayer.PlayerUID] = byPlayer as IServerPlayer;
-
-                // Saves the last known owner's "offlinehours" to all of the containers owned by them and loaded into memory.
-                foreach (var container in LoadedContainers.Where(c => c.OwnerUID == byPlayer.PlayerUID))
-                {
-                    container.Blockentity?.MarkDirty(true);
-
-                    if (container.Blockentity is BlockEntityContainer bec)
-                    {
-                        foreach (var slot in bec.Inventory)
-                        {
-                            slot.MarkDirty();
-                        }
-                    }
-                }
-
-                Mod.Logger.Notification($"[OfflinePreserve] {byPlayer.PlayerName} connected. LastLogout: {data.LastLogoutTimestamp}, TotalOffline: {data.TotalOfflineHours}");
-            };
-
-            api.Event.PlayerDisconnect += byPlayer =>
-            {
-                var playerOfflineHoursData = byPlayer.ServerData.CustomPlayerData;
-                string modKey = "NoOfflineFoodSpoil";
-
-                playerOfflineHoursData.TryGetValue(modKey, out string? json);
-                // Logic called to fetch the player's offline hours and to deserialize the data. I should use DRY here but honestly I am so done at this point and I don't want to retest for the 40th time after moving this to it's own function.
-                OfflineHours data;
-                try
-                {
-                    if (string.IsNullOrEmpty(json)) data = new OfflineHours();
-                    else data = JsonConvert.DeserializeObject<OfflineHours>(json) ?? new OfflineHours();
-                }
-                catch (Exception ex)
-                {
-                    api.Logger.Error($"[NoOfflineFoodSpoil] Failed to deserialize offline hours for player. Resetting to 0. Error: {ex.Message}");
-                    data = new OfflineHours();
-                }
-
-                data.LastLogoutTimestamp = api.World.Calendar.TotalHours;
-                playerOfflineHoursData[modKey] = JsonConvert.SerializeObject(data);
-
-                OnlinePlayers.Remove(byPlayer.PlayerUID);
-
-                // Saves the last known owner's "offlinehours" to all of the containers owned by them and loaded into memory.
-                foreach (var container in LoadedContainers.Where(c => c.OwnerUID == byPlayer.PlayerUID))
-                {
-                    container.Blockentity?.MarkDirty(true);
-
-                    if (container.Blockentity is BlockEntityContainer bec)
-                    {
-                        foreach (var slot in bec.Inventory)
-                        {
-                            slot.MarkDirty();
-                        }
-                    }
-                }
-
-                Mod.Logger.Notification($"[OfflinePreserve] {byPlayer.PlayerName} disconnected. LastLogout: {data.LastLogoutTimestamp}, TotalOffline: {data.TotalOfflineHours}");
-            };
+            ServerApi = api;
+            LoadConfig(api);
+            NoOfflineContainerFoodSpoilCommands.Register(this, api);
+            api.Event.DidPlaceBlock += OnDidPlaceBlock;
         }
-
 
         public override void AssetsFinalize(ICoreAPI api)
         {
             base.AssetsFinalize(api);
 
-            // Attaches the custom Block Entity Behavior to each block that is recognized as a container with an inventory.
-            foreach (var block in api.World.Blocks) 
+            foreach (var block in api.World.Blocks)
             {
-                if (block.Code == null || block.EntityClass == null) continue;
+                if (block?.Code == null || block.EntityClass == null) continue;
 
-                System.Type entityType = api.ClassRegistry.GetBlockEntity(block.EntityClass);
-
+                Type entityType = api.ClassRegistry.GetBlockEntity(block.EntityClass);
                 bool isContainer = entityType != null && typeof(IBlockEntityContainer).IsAssignableFrom(entityType);
-
                 if (!isContainer) continue;
 
-                block.BlockEntityBehaviors = block.BlockEntityBehaviors.Append(new BlockEntityBehaviorType() { Name = "OfflinePreserve" }).ToArray();
+                BlockEntityBehaviorType[] existingBehaviors = block.BlockEntityBehaviors ?? Array.Empty<BlockEntityBehaviorType>();
+                if (existingBehaviors.Any(behavior => behavior.Name == "OfflinePreserve")) continue;
+
+                block.BlockEntityBehaviors = existingBehaviors
+                    .Append(new BlockEntityBehaviorType { Name = "OfflinePreserve" })
+                    .ToArray();
             }
         }
 
-        public class BlockEntityBehaviorOfflinePreserve(BlockEntity b) : BlockEntityBehavior(b)
+        private void LoadConfig(ICoreAPI api)
         {
-            public string? OwnerUID;
-            public string? VisitorUID;
-            public double LastKnownOwnerOfflineHours;
-            public double LastKnownVisitorOfflineHours;
-            public double LastKnownCalendarTime;
-            public double VisitorStartTime;
-            private NoOfflineContainerFoodSpoilModSystem? modSys;
-
-            // Saves and loads variables that the block stores to disk when it loads and unloads.
-            public override void ToTreeAttributes(ITreeAttribute tree)
+            try
             {
-                base.ToTreeAttributes(tree);
-                if (OwnerUID != null) tree.SetString("OwnerUID", OwnerUID);
-                if (VisitorUID != null) tree.SetString("VisitorUID", VisitorUID);
-                tree.SetDouble("LastKnownOwnerOfflineHours", LastKnownOwnerOfflineHours);
-                tree.SetDouble("LastKnownVisitorOfflineHours", LastKnownVisitorOfflineHours);
-                tree.SetDouble("LastKnownCalendarTime", LastKnownCalendarTime);
-                tree.SetDouble("VisitorStartTime", VisitorStartTime);
+                Config = api.LoadModConfig<NoOfflineContainerFoodSpoilConfig>(ConfigFileName) ?? NoOfflineContainerFoodSpoilConfig.CreateDefault();
             }
-            public override void FromTreeAttributes(ITreeAttribute tree, IWorldAccessor worldAccessor)
+            catch (Exception ex)
             {
-                base.FromTreeAttributes(tree, worldAccessor);
-                OwnerUID = tree.GetString("OwnerUID");
-                VisitorUID = tree.GetString("VisitorUID");
-                LastKnownOwnerOfflineHours = tree.GetDouble("LastKnownOwnerOfflineHours");
-                LastKnownVisitorOfflineHours = tree.GetDouble("LastKnownVisitorOfflineHours");
-                LastKnownCalendarTime = tree.GetDouble("LastKnownCalendarTime");
-                VisitorStartTime = tree.GetDouble("VisitorStartTime");
+                api.Logger.Error($"[NoOfflineFoodSpoil] Failed to load config. Using defaults. Error: {ex.Message}");
+                Config = NoOfflineContainerFoodSpoilConfig.CreateDefault();
             }
 
-            // Called when chunk that container is in is loaded.
-            public override void Initialize(ICoreAPI api, JsonObject properties)
+            Config.ClampToSafeMinimums();
+            api.StoreModConfig(Config, ConfigFileName);
+        }
+
+        internal void SaveConfigAndRefreshLoadedContainers()
+        {
+            if (ServerApi == null)
             {
-                base.Initialize(api, properties);
-
-                if (b is BlockEntityContainer container)
-                {
-                    container.Inventory.OnAcquireTransitionSpeed -= OnAcquireTransitionSpeed;
-                    container.Inventory.OnAcquireTransitionSpeed += OnAcquireTransitionSpeed;
-
-                    container.Inventory.OnInventoryOpened -= OnInventoryOpened;
-                    container.Inventory.OnInventoryOpened += OnInventoryOpened;
-
-                    api.Logger.Notification($"Initialize has been called on {container.Block.Code}");
-
-                    if (api.Side == EnumAppSide.Server)
-                    {
-                        modSys = api.ModLoader.GetModSystem<NoOfflineContainerFoodSpoilModSystem>();
-                        modSys.LoadedContainers.Add(this);
-
-                        ICoreServerAPI? castedAPI = api as ICoreServerAPI;
-                        if (castedAPI == null || OwnerUID == null) return;
-
-                        var ownerProfile = castedAPI.PlayerData.GetPlayerDataByUid(OwnerUID);
-                        if (ownerProfile == null) return;
-
-                        ownerProfile.CustomPlayerData.TryGetValue("NoOfflineFoodSpoil", out string? json);
-                        // Logic called to fetch the player's offline hours and to deserialize the data.
-                        OfflineHours data;
-                        try
-                        {
-                            data = string.IsNullOrEmpty(json) ? new OfflineHours() : JsonConvert.DeserializeObject<OfflineHours>(json) ?? new OfflineHours();
-                        }
-                        catch
-                        {
-                            data = new OfflineHours();
-                        }
-
-                        double currentTotalOfflineHours = data.TotalOfflineHours;
-                        if (data.LastLogoutTimestamp > 0)
-                        {
-                            currentTotalOfflineHours += Math.Max(0, castedAPI.World.Calendar.TotalHours - data.LastLogoutTimestamp);
-                        }
-
-                        double offlineHoursGap = currentTotalOfflineHours - LastKnownOwnerOfflineHours; // Checks how much time has passed while the owner has been offline.
-
-                        if (VisitorUID != null && offlineHoursGap > 0 && VisitorStartTime > 0)
-                        {
-                            var visitorProfile = castedAPI.PlayerData.GetPlayerDataByUid(VisitorUID);
-                            if (visitorProfile != null)
-                            {
-                                visitorProfile.CustomPlayerData.TryGetValue("NoOfflineFoodSpoil", out string? vJson);
-                                var vData = string.IsNullOrEmpty(vJson) ? new OfflineHours() : JsonConvert.DeserializeObject<OfflineHours>(vJson) ?? new OfflineHours();
-
-                                double currentVisitorOfflineHours = vData.TotalOfflineHours;
-                                if (vData.LastLogoutTimestamp > 0)
-                                {
-                                    currentVisitorOfflineHours += Math.Max(0, castedAPI.World.Calendar.TotalHours - vData.LastLogoutTimestamp);
-                                }
-
-                                double visitorOfflineGap = currentVisitorOfflineHours - LastKnownVisitorOfflineHours;
-                                double timeElapsedSinceVisitor = castedAPI.World.Calendar.TotalHours - VisitorStartTime;
-                                double visitorOnlineTime = Math.Max(0, timeElapsedSinceVisitor - visitorOfflineGap);
-
-                                offlineHoursGap = Math.Max(0, offlineHoursGap - visitorOnlineTime);
-                            }
-
-                            VisitorUID = null;
-                            VisitorStartTime = 0;
-                        }
-
-                        if (offlineHoursGap > 0)
-                        {
-                            ApplyForgiveness(container.Inventory, offlineHoursGap); // Applies forgivenes to each item in the chest based on how long the owner has been offline.
-                            api.Logger.Notification($"[OfflinePreserve] Rewound spoilage by {offlineHoursGap} hours for {container.Block.Code}");
-                        }
-
-                        LastKnownOwnerOfflineHours = currentTotalOfflineHours;
-                        LastKnownCalendarTime = castedAPI.World.Calendar.TotalHours;
-                        b.MarkDirty(true);
-                    }
-                }
+                return;
             }
 
-            // Cleans up subscriptions to events.
-            public override void OnBlockRemoved()
+            Config.ClampToSafeMinimums();
+            ServerApi.StoreModConfig(Config, ConfigFileName);
+
+            foreach (BlockEntityBehaviorOfflinePreserve behavior in LoadedContainers.ToArray())
             {
-                base.OnBlockRemoved();
-                if (Blockentity is BlockEntityContainer container)
-                {
-                    container.Inventory.OnAcquireTransitionSpeed -= OnAcquireTransitionSpeed;
-                    container.Inventory.OnInventoryOpened -= OnInventoryOpened;
-                }
-                RemoveFromRegistry();
-            }
-
-            // Cleans up subscriptions to events.
-            public override void OnBlockUnloaded()
-            {
-                base.OnBlockUnloaded();
-                if (Blockentity is BlockEntityContainer container)
-                {
-                    container.Inventory.OnAcquireTransitionSpeed -= OnAcquireTransitionSpeed;
-                    container.Inventory.OnInventoryOpened -= OnInventoryOpened;
-                }
-                RemoveFromRegistry();
-            }
-
-            // Sets the spoilage to zero for a chest if an owner is offline and a visitor doesn't exist.
-            private float OnAcquireTransitionSpeed(EnumTransitionType transType, ItemStack stack, float baseMul)
-            {
-                if (OwnerUID == null || Api == null) return baseMul;
-
-                if (Api.Side == EnumAppSide.Server)
-                {
-                    if (modSys == null) return baseMul;
-
-                    bool isOwnerOnline = modSys.OnlinePlayers.TryGetValue(OwnerUID, out var ownerPlayer)
-                             && ownerPlayer?.ConnectionState == EnumClientState.Playing;
-
-                    bool isVisitorOnline = VisitorUID != null
-                            && modSys.OnlinePlayers.TryGetValue(VisitorUID, out var visitorPlayer)
-                            && visitorPlayer?.ConnectionState == EnumClientState.Playing;
-
-                    if (isOwnerOnline || isVisitorOnline)
-                    {
-                        return baseMul;
-                    }
-
-                    return 0f;
-                }
-                else
-                {
-                    bool isOwnerOnlineClient = Api.World.AllOnlinePlayers.Any(p => p?.PlayerUID == OwnerUID);
-                    bool isVisitorOnlineClient = VisitorUID != null && Api.World.AllOnlinePlayers.Any(p => p?.PlayerUID == VisitorUID);
-
-                    if (isOwnerOnlineClient || isVisitorOnlineClient)
-                    {
-                        return baseMul;
-                    }
-
-                    return 0f;
-                }
-            }
-
-            // Sets a visitor when a container is opened.
-            private void OnInventoryOpened(IPlayer player)
-            {
-                if (Api.Side != EnumAppSide.Server) return;
-
-                if (player.PlayerUID == OwnerUID)
-                {
-                    VisitorUID = null;
-                    VisitorStartTime = 0;
-                }
-                else
-                {
-                    VisitorUID = player.PlayerUID;
-                    VisitorStartTime = Api.World.Calendar.TotalHours;
-
-                    var profile = (Api as ICoreServerAPI)?.PlayerData.GetPlayerDataByUid(player.PlayerUID);
-                    if (profile == null) return;
-
-                    profile.CustomPlayerData.TryGetValue("NoOfflineFoodSpoil", out string? json);
-                    OfflineHours data;
-                    try
-                    {
-                        data = string.IsNullOrEmpty(json) ? new OfflineHours() : JsonConvert.DeserializeObject<OfflineHours>(json) ?? new OfflineHours();
-                        LastKnownVisitorOfflineHours = data.TotalOfflineHours;
-                    }
-                    catch
-                    {
-                        data = new OfflineHours();
-                    }
-                }
-
-                Blockentity.MarkDirty(true);
-            }
-
-            // Helper method for performing "forgiveness" to each item in a container.
-            private void ApplyForgiveness(IInventory inventory, double hoursToRewind)
-            {
-                foreach (var slot in inventory)
-                {
-                    if (slot.Empty) continue;
-
-                    ITreeAttribute? attr = slot.Itemstack.Attributes.GetTreeAttribute("transitionState");
-                    if (attr == null) continue;
-
-                    double lastUpdated = attr.GetDouble("lastUpdatedTotalHours");
-                    if (lastUpdated > 0)
-                    {
-                        double currentTime = Api.World.Calendar.TotalHours;
-                        double newLastUpdated = Math.Min(currentTime, lastUpdated + hoursToRewind);
-
-                        attr.SetDouble("lastUpdatedTotalHours", newLastUpdated);
-
-                        double created = attr.GetDouble("createdTotalHours");
-                        if (created > 0)
-                        {
-                            attr.SetDouble("createdTotalHours", Math.Min(Api.World.Calendar.TotalHours, created + hoursToRewind));
-                        }
-
-                        slot.Itemstack.TempAttributes.RemoveAttribute("transitionState");
-                        slot.MarkDirty();
-                    }
-                }
-            }
-
-            // Helper method to remove a block from the "Loaded Containers" list.
-            private void RemoveFromRegistry()
-            {
-                if (Api?.Side == EnumAppSide.Server && modSys != null)
-                {
-                    modSys.LoadedContainers.Remove(this);
-                }
+                behavior.OnConfigChanged();
             }
         }
+
+        private void OnDidPlaceBlock(IServerPlayer player, int oldBlockId, BlockSelection blockSel, ItemStack stack)
+        {
+            if (ServerApi is not { Side: EnumAppSide.Server }) return;
+            BlockEntity? blockEntity = ServerApi.World.BlockAccessor.GetBlockEntity(blockSel.Position);
+            if (blockEntity is not BlockEntityContainer container) return;
+            BlockEntityBehaviorOfflinePreserve? behavior = blockEntity.GetBehavior<BlockEntityBehaviorOfflinePreserve>();
+            if (behavior == null) return;
+            behavior.SeedResident(player.PlayerUID);
+            behavior.Init(container, ServerApi);
+        }
+    }
+
+    public sealed class BlockEntityBehaviorOfflinePreserve : BlockEntityBehavior
+    {
+        private const double TrackingCacheWindowSeconds = 30;
+        private const string TrackedUsersTreeKey = "TrackedUsersJson";
+        private const double PresencePersistIntervalSeconds = 300;
+
+        private float cachedPerishMultiplier = 1f;
+        private bool cachedHasOnlineTrackedUser;
+        private double cachedNextRefreshUnixSeconds;
+        private bool trackingDirty = true;
+
+        private NoOfflineContainerFoodSpoilModSystem? modSys;
+        private string? legacyOwnerUid;
+
+        public List<TrackedUserEntry> TrackedUsers { get; private set; } = new();
+
+        public BlockEntityBehaviorOfflinePreserve(BlockEntity blockEntity) : base(blockEntity)
+        {
+        }
+
+        public override void ToTreeAttributes(ITreeAttribute tree)
+        {
+            base.ToTreeAttributes(tree);
+            tree.SetString(TrackedUsersTreeKey, JsonConvert.SerializeObject(TrackedUsers));
+        }
+
+        public override void FromTreeAttributes(ITreeAttribute tree, IWorldAccessor worldAccessor)
+        {
+            base.FromTreeAttributes(tree, worldAccessor);
+
+            legacyOwnerUid = tree.GetString("OwnerUID");
+
+            string trackedUsersJson = tree.GetString(TrackedUsersTreeKey);
+            if (string.IsNullOrWhiteSpace(trackedUsersJson))
+            {
+                TrackedUsers = new List<TrackedUserEntry>();
+                return;
+            }
+
+            try
+            {
+                TrackedUsers = JsonConvert.DeserializeObject<List<TrackedUserEntry>>(trackedUsersJson) ?? new List<TrackedUserEntry>();
+            }
+            catch
+            {
+                TrackedUsers = new List<TrackedUserEntry>();
+            }
+        }
+
+        public override void Initialize(ICoreAPI api, JsonObject properties)
+        {
+            base.Initialize(api, properties);
+
+            if (Blockentity is not BlockEntityContainer container || api.Side != EnumAppSide.Server)
+            {
+                return;
+            }
+
+            Init(container, api);
+        }
+        
+        internal void Init(BlockEntityContainer container, ICoreAPI api)
+        {
+            modSys = api.ModLoader.GetModSystem<NoOfflineContainerFoodSpoilModSystem>();
+
+            container.Inventory.OnAcquireTransitionSpeed -= OnAcquireTransitionSpeed;
+            container.Inventory.OnAcquireTransitionSpeed += OnAcquireTransitionSpeed;
+
+            container.Inventory.OnInventoryOpened -= OnInventoryOpened;
+            container.Inventory.OnInventoryOpened += OnInventoryOpened;
+
+            container.Inventory.SlotModified -= OnSlotModified;
+            container.Inventory.SlotModified += OnSlotModified;
+
+            modSys.LoadedContainers.Add(this);
+            MigrateLegacyOwnerIfNeeded();
+            RefreshTrackingCache(forcePersist: true);
+        }
+
+        public override void OnBlockRemoved()
+        {
+            base.OnBlockRemoved();
+            Unsubscribe();
+        }
+
+        public override void OnBlockUnloaded()
+        {
+            base.OnBlockUnloaded();
+            Unsubscribe();
+        }
+
+        public void SeedResident(string playerUid)
+        {
+            if (string.IsNullOrWhiteSpace(playerUid))
+            {
+                return;
+            }
+
+            double now = GetUnixTimeSeconds();
+            TrackedUserEntry entry = GetOrCreateEntry(playerUid);
+            entry.State = TrackedUserState.Resident;
+            entry.LastMeaningfulInteractionUnixSeconds = now;
+            entry.LastResidentPresenceUnixSeconds = now;
+            entry.LastProvisionalInteractionUnixSeconds = 0;
+
+            MarkTrackingDirty();
+            RefreshTrackingCache(forcePersist: true);
+        }
+
+        private void OnInventoryOpened(IPlayer player)
+        {
+            TrackedUserEntry? entry = FindEntry(player.PlayerUID);
+            if (entry?.State == TrackedUserState.Resident)
+            {
+                entry.LastResidentPresenceUnixSeconds = GetUnixTimeSeconds();
+                MarkTrackingDirty();
+                Blockentity.MarkDirty();
+            }
+        }
+
+        private void OnSlotModified(int slotId)
+        {
+            AttributeMeaningfulInteractionToOpenViewers();
+        }
+
+        private float OnAcquireTransitionSpeed(EnumTransitionType transType, ItemStack stack, float baseMul)
+        {
+            // TODO: this method is heavily cached as the game seems to execute it basically every tick?
+            //   currently the cache is 30 seconds, but maybe its worth randomizing it a bit to avoid all chests expiring at the same time?
+            EnsureTrackingCacheCurrent();
+            return cachedHasOnlineTrackedUser ? baseMul : baseMul * cachedPerishMultiplier;
+        }
+
+        private void AttributeMeaningfulInteractionToOpenViewers()
+        {
+            List<string> openViewerUids = GetOpenViewerUids();
+            if (openViewerUids.Count == 0)
+            {
+                return;
+            }
+
+            double now = GetUnixTimeSeconds();
+            foreach (string playerUid in openViewerUids)
+            {
+                ProcessMeaningfulInteraction(playerUid, now);
+            }
+
+            MarkTrackingDirty();
+            RefreshTrackingCache(forcePersist: true);
+        }
+
+        private void ProcessMeaningfulInteraction(string playerUid, double now)
+        {
+            TrackedUserEntry entry = GetOrCreateEntry(playerUid);
+
+            if (entry.State == TrackedUserState.Resident)
+            {
+                entry.LastMeaningfulInteractionUnixSeconds = now;
+                entry.LastResidentPresenceUnixSeconds = now;
+                return;
+            }
+
+            double promotionWindowSeconds = GetConfig().PromotionWindowRealDays * SecondsPerDay;
+            bool withinPromotionWindow = entry.LastProvisionalInteractionUnixSeconds > 0
+                && now - entry.LastProvisionalInteractionUnixSeconds <= promotionWindowSeconds;
+
+            if (withinPromotionWindow)
+            {
+                entry.State = TrackedUserState.Resident;
+                entry.LastMeaningfulInteractionUnixSeconds = now;
+                entry.LastResidentPresenceUnixSeconds = now;
+                entry.LastProvisionalInteractionUnixSeconds = 0;
+                return;
+            }
+
+            entry.State = TrackedUserState.Provisional;
+            entry.LastMeaningfulInteractionUnixSeconds = now;
+            entry.LastProvisionalInteractionUnixSeconds = now;
+        }
+
+        private void MigrateLegacyOwnerIfNeeded()
+        {
+            if (TrackedUsers.Count > 0 || string.IsNullOrWhiteSpace(legacyOwnerUid))
+            {
+                return;
+            }
+
+            SeedResident(legacyOwnerUid);
+            legacyOwnerUid = null;
+        }
+
+        private void EnsureTrackingCacheCurrent()
+        {
+            double now = GetUnixTimeSeconds();
+            if (!trackingDirty && now < cachedNextRefreshUnixSeconds)
+            {
+                return;
+            }
+
+            RefreshTrackingCache(forcePersist: false);
+        }
+
+        private void RefreshTrackingCache(bool forcePersist)
+        {
+            double now = GetUnixTimeSeconds();
+            bool changed = forcePersist;
+            bool hasOnlineTrackedUser = false;
+            NoOfflineContainerFoodSpoilConfig config = GetConfig();
+            TrackedUserEntry? pinnedResident = GetPinnedResident();
+            List<TrackedUserEntry>? entriesToRemove = null;
+
+            for (int index = 0; index < TrackedUsers.Count; index++)
+            {
+                TrackedUserEntry entry = TrackedUsers[index];
+                RuntimeTrackedUserState state = EvaluateRuntimeState(entry, now, config);
+
+                if (state.RefreshResidentPresence)
+                {
+                    entry.LastResidentPresenceUnixSeconds = now;
+                    changed = true;
+                }
+
+                if (state.CountsForSpoilage)
+                {
+                    hasOnlineTrackedUser = true;
+                }
+
+                if (state.RemoveFromTracking && !ReferenceEquals(entry, pinnedResident))
+                {
+                    entriesToRemove ??= new List<TrackedUserEntry>();
+                    entriesToRemove.Add(entry);
+                }
+            }
+
+            if (entriesToRemove != null)
+            {
+                foreach (TrackedUserEntry entry in entriesToRemove)
+                {
+                    changed |= TrackedUsers.Remove(entry);
+                }
+            }
+
+            if (TrackedUsers.Count > config.TrackedPlayerLimit)
+            {
+                List<TrackedUserEntry> orderedEntries = TrackedUsers
+                    .OrderBy(entry => entry.State == TrackedUserState.Resident ? 1 : 0)
+                    .ThenBy(entry => GetEntryReferenceTime(entry))
+                    .ToList();
+
+                while (orderedEntries.Count > config.TrackedPlayerLimit)
+                {
+                    int removeIndex = orderedEntries.FindIndex(entry => !ReferenceEquals(entry, pinnedResident));
+                    if (removeIndex < 0)
+                    {
+                        break;
+                    }
+
+                    TrackedUserEntry entryToRemove = orderedEntries[removeIndex];
+                    orderedEntries.RemoveAt(removeIndex);
+                    changed |= TrackedUsers.Remove(entryToRemove);
+                }
+            }
+
+            cachedHasOnlineTrackedUser = hasOnlineTrackedUser;
+            cachedPerishMultiplier = config.OfflineSpoilageMultiplier;
+            cachedNextRefreshUnixSeconds = now + TrackingCacheWindowSeconds;
+            trackingDirty = false;
+
+            if (changed)
+            {
+                Blockentity.MarkDirty();
+            }
+        }
+
+        private void MarkTrackingDirty()
+        {
+            trackingDirty = true;
+            cachedNextRefreshUnixSeconds = 0;
+        }
+
+        private TrackedUserEntry? GetPinnedResident()
+        {
+            return TrackedUsers
+                .Where(entry => entry.State == TrackedUserState.Resident)
+                .OrderByDescending(GetEntryReferenceTime)
+                .FirstOrDefault();
+        }
+
+        internal ContainerTrackingState EvaluateStateForCommand()
+        {
+            RefreshTrackingCache(forcePersist: true);
+            return EvaluateTrackedUsersForDebug();
+        }
+
+        internal void OnConfigChanged()
+        {
+            MarkTrackingDirty();
+            RefreshTrackingCache(forcePersist: true);
+        }
+
+        internal bool TryRemoveTrackedUserForCommand(string playerUid, out string error)
+        {
+            error = string.Empty;
+
+            TrackedUserEntry? entry = FindEntry(playerUid);
+            if (entry == null)
+            {
+                error = "That player is not tracked on this container.";
+                return false;
+            }
+
+            if (entry.State == TrackedUserState.Resident && TrackedUsers.Count(other => other.State == TrackedUserState.Resident && other.PlayerUid != playerUid) == 0)
+            {
+                error = "Cannot remove the last resident from this container.";
+                return false;
+            }
+
+            if (!TrackedUsers.Remove(entry))
+            {
+                error = "Failed to remove the tracked player from this container.";
+                return false;
+            }
+
+            MarkTrackingDirty();
+            RefreshTrackingCache(forcePersist: true);
+            return true;
+        }
+
+        private ContainerTrackingState EvaluateTrackedUsersForDebug()
+        {
+            double now = GetUnixTimeSeconds();
+            NoOfflineContainerFoodSpoilConfig config = GetConfig();
+            List<TrackedUserStatus> states = new List<TrackedUserStatus>(TrackedUsers.Count);
+            bool hasValidTrackedUser = false;
+
+            foreach (TrackedUserEntry entry in TrackedUsers)
+            {
+                TrackedUserStatus state = BuildDebugState(entry, now, config);
+                states.Add(state);
+                hasValidTrackedUser |= state.CountsForSpoilage;
+            }
+
+            return new ContainerTrackingState
+            {
+                UserStates = states,
+                HasValidTrackedUser = hasValidTrackedUser
+            };
+        }
+
+        private RuntimeTrackedUserState EvaluateRuntimeState(TrackedUserEntry entry, double now, NoOfflineContainerFoodSpoilConfig config)
+        {
+            if (entry.State == TrackedUserState.Provisional)
+            {
+                IPlayer? player = GetOnlinePlayer(entry.PlayerUid);
+                bool online = player != null;
+                double provisionalAgeSeconds = Math.Max(0, now - entry.LastProvisionalInteractionUnixSeconds);
+                bool withinTimeWindow = provisionalAgeSeconds <= config.ProvisionalExpiryRealHours * SecondsPerHour;
+
+                return new RuntimeTrackedUserState(
+                    countsForSpoilage: online && withinTimeWindow,
+                    removeFromTracking: !withinTimeWindow,
+                    refreshResidentPresence: false
+                );
+            }
+
+            IPlayer? residentPlayer = GetOnlinePlayer(entry.PlayerUid);
+            double? residentDistance = GetDistanceToContainer(residentPlayer);
+            bool residentOnline = residentPlayer != null;
+            bool withinKeepaliveRadius = residentDistance.HasValue && residentDistance.Value <= config.ResidentKeepaliveRadiusBlocks;
+            bool beyondFarAwayRadius = residentDistance.HasValue && residentDistance.Value > config.FarAwayRadiusBlocks;
+            double referenceTime = GetEntryReferenceTime(entry);
+            double thresholdSeconds = config.ResidentExpiryRealDays * SecondsPerDay;
+
+            if (residentOnline && beyondFarAwayRadius)
+            {
+                thresholdSeconds = config.FarAwayExpiryRealHours * SecondsPerHour;
+            }
+
+            bool refreshResidentPresence = false;
+            if (withinKeepaliveRadius)
+            {
+                double previousPresence = entry.LastResidentPresenceUnixSeconds;
+                if (now - previousPresence >= PresencePersistIntervalSeconds)
+                {
+                    refreshResidentPresence = true;
+                }
+
+                referenceTime = now;
+            }
+
+            double residentAgeSeconds = Math.Max(0, now - referenceTime);
+            bool withinTrackingWindow = residentAgeSeconds <= thresholdSeconds;
+
+            return new RuntimeTrackedUserState(
+                countsForSpoilage: residentOnline && withinTrackingWindow,
+                removeFromTracking: !withinTrackingWindow,
+                refreshResidentPresence: refreshResidentPresence
+            );
+        }
+
+        private TrackedUserStatus BuildDebugState(TrackedUserEntry entry, double now, NoOfflineContainerFoodSpoilConfig config)
+        {
+            if (entry.State == TrackedUserState.Provisional)
+            {
+                return BuildProvisionalDebugState(entry, now, config);
+            }
+
+            return BuildResidentDebugState(entry, now, config);
+        }
+
+        private TrackedUserStatus BuildResidentDebugState(TrackedUserEntry entry, double now, NoOfflineContainerFoodSpoilConfig config)
+        {
+            IPlayer? player = GetOnlinePlayer(entry.PlayerUid);
+            double? distance = GetDistanceToContainer(player);
+            bool online = player != null;
+            bool withinKeepaliveRadius = distance.HasValue && distance.Value <= config.ResidentKeepaliveRadiusBlocks;
+            bool beyondFarAwayRadius = distance.HasValue && distance.Value > config.FarAwayRadiusBlocks;
+            double referenceTime = GetEntryReferenceTime(entry);
+
+            if (withinKeepaliveRadius)
+            {
+                referenceTime = now;
+            }
+
+            double thresholdSeconds = config.ResidentExpiryRealDays * SecondsPerDay;
+            string reason = online ? "resident-online" : "resident-offline";
+
+            if (withinKeepaliveRadius)
+            {
+                reason = "resident-nearby-keepalive";
+            }
+            else if (online && beyondFarAwayRadius)
+            {
+                thresholdSeconds = config.FarAwayExpiryRealHours * SecondsPerHour;
+                reason = "resident-online-far-away";
+            }
+
+            double ageSeconds = Math.Max(0, now - referenceTime);
+            bool withinTrackingWindow = ageSeconds <= thresholdSeconds;
+            bool countsForSpoilage = online && withinTrackingWindow;
+            bool removeFromTracking = !withinTrackingWindow;
+
+            return new TrackedUserStatus
+            {
+                Entry = entry,
+                Online = online,
+                DistanceBlocks = distance,
+                WithinKeepaliveRadius = withinKeepaliveRadius,
+                BeyondFarAwayRadius = beyondFarAwayRadius,
+                AgeSeconds = ageSeconds,
+                ThresholdSeconds = thresholdSeconds,
+                CountsForSpoilage = countsForSpoilage,
+                RemoveFromTracking = removeFromTracking,
+                Reason = countsForSpoilage
+                    ? reason
+                    : (removeFromTracking ? $"{reason}-expired" : $"{reason}-not-counting")
+            };
+        }
+
+        private TrackedUserStatus BuildProvisionalDebugState(TrackedUserEntry entry, double now, NoOfflineContainerFoodSpoilConfig config)
+        {
+            IPlayer? player = GetOnlinePlayer(entry.PlayerUid);
+            double? distance = GetDistanceToContainer(player);
+            bool online = player != null;
+            double thresholdSeconds = config.ProvisionalExpiryRealHours * SecondsPerHour;
+            double ageSeconds = Math.Max(0, now - entry.LastProvisionalInteractionUnixSeconds);
+            bool withinTimeWindow = ageSeconds <= thresholdSeconds;
+
+            return new TrackedUserStatus
+            {
+                Entry = entry,
+                Online = online,
+                DistanceBlocks = distance,
+                WithinKeepaliveRadius = false,
+                BeyondFarAwayRadius = distance.HasValue && distance.Value > config.FarAwayRadiusBlocks,
+                AgeSeconds = ageSeconds,
+                ThresholdSeconds = thresholdSeconds,
+                CountsForSpoilage = online && withinTimeWindow,
+                RemoveFromTracking = !withinTimeWindow,
+                Reason = online
+                    ? (withinTimeWindow ? "provisional-online-grace" : "provisional-expired")
+                    : (withinTimeWindow ? "provisional-offline-not-counting" : "provisional-expired")
+            };
+        }
+
+        private NoOfflineContainerFoodSpoilConfig GetConfig()
+        {
+            return modSys?.Config ?? NoOfflineContainerFoodSpoilConfig.CreateDefault();
+        }
+
+        internal List<string> GetOpenViewerUidsForCommand()
+        {
+            return GetOpenViewerUids();
+        }
+
+        private List<string> GetOpenViewerUids()
+        {
+            if (Blockentity is not BlockEntityContainer container)
+            {
+                return new List<string>();
+            }
+
+            return container.Inventory.openedByPlayerGUIds?
+                .Where(uid => !string.IsNullOrWhiteSpace(uid))
+                .Distinct()
+                .OrderBy(uid => uid)
+                .ToList() ?? new List<string>();
+        }
+
+        private IPlayer? GetOnlinePlayer(string playerUid)
+        {
+            ICoreServerAPI? api = modSys?.ServerApi;
+            if (api == null || string.IsNullOrWhiteSpace(playerUid))
+            {
+                return null;
+            }
+
+            return api.World.PlayerByUid(playerUid) is IServerPlayer { Entity: not null, ConnectionState: EnumClientState.Playing } player ? player : null;
+        }
+
+        private double? GetDistanceToContainer(IPlayer? player)
+        {
+            if (player?.Entity?.Pos == null) return null;
+
+            double dx = player.Entity.Pos.X - (Blockentity.Pos.X + 0.5);
+            double dy = player.Entity.Pos.Y - (Blockentity.Pos.Y + 0.5);
+            double dz = player.Entity.Pos.Z - (Blockentity.Pos.Z + 0.5);
+
+            return Math.Sqrt(dx * dx + dy * dy + dz * dz);
+        }
+
+        private TrackedUserEntry? FindEntry(string playerUid)
+        {
+            return TrackedUsers.FirstOrDefault(entry => entry.PlayerUid == playerUid);
+        }
+
+        private TrackedUserEntry GetOrCreateEntry(string playerUid)
+        {
+            TrackedUserEntry? existingEntry = FindEntry(playerUid);
+            if (existingEntry != null)
+            {
+                return existingEntry;
+            }
+
+            TrackedUserEntry newEntry = new TrackedUserEntry
+            {
+                PlayerUid = playerUid,
+                State = TrackedUserState.Provisional
+            };
+
+            TrackedUsers.Add(newEntry);
+            return newEntry;
+        }
+
+        private void Unsubscribe()
+        {
+            if (Blockentity is BlockEntityContainer container)
+            {
+                container.Inventory.OnAcquireTransitionSpeed -= OnAcquireTransitionSpeed;
+                container.Inventory.OnInventoryOpened -= OnInventoryOpened;
+                container.Inventory.SlotModified -=  OnSlotModified;
+            }
+
+            modSys?.LoadedContainers.Remove(this);
+        }
+
+        private static double GetEntryReferenceTime(TrackedUserEntry entry)
+        {
+            return Math.Max(entry.LastMeaningfulInteractionUnixSeconds, entry.LastResidentPresenceUnixSeconds);
+        }
+
+        private static double GetUnixTimeSeconds()
+        {
+            return DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        }
+
+        private const double SecondsPerHour = 3600;
+        private const double SecondsPerDay = 86400;
+
+    }
+
+    public enum TrackedUserState
+    {
+        Resident,
+        Provisional
+    }
+
+    public class TrackedUserEntry
+    {
+        public string PlayerUid = string.Empty;
+        public TrackedUserState State;
+        public double LastMeaningfulInteractionUnixSeconds;
+        public double LastResidentPresenceUnixSeconds;
+        public double LastProvisionalInteractionUnixSeconds;
+    }
+
+    internal sealed class TrackedUserStatus
+    {
+        public TrackedUserEntry Entry = null!;
+        public bool Online;
+        public double? DistanceBlocks;
+        public bool WithinKeepaliveRadius;
+        public bool BeyondFarAwayRadius;
+        public double AgeSeconds;
+        public double ThresholdSeconds;
+        public bool CountsForSpoilage;
+        public bool RemoveFromTracking;
+        public string Reason = string.Empty;
+    }
+
+    internal sealed class ContainerTrackingState
+    {
+        public List<TrackedUserStatus> UserStates { get; init; } = [];
+        public bool HasValidTrackedUser { get; init; }
+    }
+
+    internal readonly struct RuntimeTrackedUserState(bool countsForSpoilage, bool removeFromTracking, bool refreshResidentPresence)
+    {
+        public bool CountsForSpoilage { get; } = countsForSpoilage;
+        public bool RemoveFromTracking { get; } = removeFromTracking;
+        public bool RefreshResidentPresence { get; } = refreshResidentPresence;
     }
 }

@@ -4,10 +4,11 @@
     "modid": "noofflinecontainerfoodspoil",
     "name": "NoOfflineContainerFoodSpoil",
     "authors": [
-        "Draconikard"
+        "Draconikard",
+        "GotoFinal"
     ],
     "description": "A mod that pauses spoilage on containers when their owner is offline.",
-    "version": "2.0.2",
+    "version": "3.0.0",
     "dependencies": {
         "game": "1.21.0"
     }
