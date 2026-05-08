@@ -32,6 +32,7 @@ namespace NoOfflineContainerFoodSpoil
         private string? legacyOwnerUid;
         private bool isReconcilingPendingUnloadCatchup;
         private bool suppressCustomTransitionSpeed;
+        private bool suppressPendingUnloadCatchupWhileLoaded;
         private bool pendingUnloadCatchupReconcileScheduled;
         private int pendingUnloadCatchupInitAttempts;
 

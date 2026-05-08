@@ -9,7 +9,17 @@ namespace NoOfflineContainerFoodSpoil
 {
     public sealed partial class BlockEntityBehaviorOfflinePreserve
     {
+        internal void SaveWorldSaveCheckpointIfNeeded()
+        {
+            SaveCheckpointIfNeeded(armPendingUnloadCatchup: false);
+        }
+
         internal void SaveUnloadCheckpointIfNeeded()
+        {
+            SaveCheckpointIfNeeded(armPendingUnloadCatchup: true);
+        }
+
+        private void SaveCheckpointIfNeeded(bool armPendingUnloadCatchup)
         {
             if (isReconcilingPendingUnloadCatchup || modSys?.ServerApi == null || Blockentity is not BlockEntityContainer container)
             {
@@ -18,9 +28,11 @@ namespace NoOfflineContainerFoodSpoil
 
             if (TrackedUsers.Count == 0)
             {
-                if (HasPendingUnloadCatchup)
+                bool stateChanged = HasPendingUnloadCatchup || suppressPendingUnloadCatchupWhileLoaded;
+                if (stateChanged)
                 {
                     HasPendingUnloadCatchup = false;
+                    suppressPendingUnloadCatchupWhileLoaded = false;
                     Blockentity.MarkDirty();
                 }
 
@@ -41,20 +53,35 @@ namespace NoOfflineContainerFoodSpoil
                 slot.Itemstack!.Collectible.UpdateAndGetTransitionState(modSys.ServerApi.World, slot, EnumTransitionType.Perish);
             }
 
+            if (!hasPerishableStacks)
+            {
+                bool stateChanged = HasPendingUnloadCatchup || suppressPendingUnloadCatchupWhileLoaded;
+                if (stateChanged)
+                {
+                    HasPendingUnloadCatchup = false;
+                    suppressPendingUnloadCatchupWhileLoaded = false;
+                    Blockentity.MarkDirty();
+                }
+
+                return;
+            }
+
             LastUnloadCheckpointUnixSeconds = NoOfflineContainerFoodSpoilModSystem.GetUnixTimeSeconds();
             LastUnloadCheckpointWorldHours = modSys.ServerApi.World.Calendar.TotalHours;
-            HasPendingUnloadCatchup = hasPerishableStacks;
+            HasPendingUnloadCatchup = true;
+            suppressPendingUnloadCatchupWhileLoaded = !armPendingUnloadCatchup;
             Blockentity.MarkDirty();
-            LogDebug($"Saved unload checkpoint. HasPerishableStacks={hasPerishableStacks}, PerishableSlots={perishableSlotCount}, CheckpointUnix={NoOfflineContainerFoodSpoilModSystem.FormatUnixSecondsForLog(LastUnloadCheckpointUnixSeconds)}, CheckpointWorldHours={LastUnloadCheckpointWorldHours:0.###}.");
+            LogDebug($"Saved checkpoint. ArmPendingUnloadCatchup={armPendingUnloadCatchup}, PerishableSlots={perishableSlotCount}, CheckpointUnix={NoOfflineContainerFoodSpoilModSystem.FormatUnixSecondsForLog(LastUnloadCheckpointUnixSeconds)}, CheckpointWorldHours={LastUnloadCheckpointWorldHours:0.###}.");
         }
 
         internal void TryReconcilePendingUnloadCatchup(IWorldAccessor world)
         {
             if (TrackedUsers.Count == 0)
             {
-                if (HasPendingUnloadCatchup)
+                if (HasPendingUnloadCatchup || suppressPendingUnloadCatchupWhileLoaded)
                 {
                     HasPendingUnloadCatchup = false;
+                    suppressPendingUnloadCatchupWhileLoaded = false;
                     Blockentity.MarkDirty();
                 }
 
@@ -62,6 +89,11 @@ namespace NoOfflineContainerFoodSpoil
             }
 
             if (!HasPendingUnloadCatchup || isReconcilingPendingUnloadCatchup || modSys?.ServerApi == null || Blockentity is not BlockEntityContainer container)
+            {
+                return;
+            }
+
+            if (suppressPendingUnloadCatchupWhileLoaded)
             {
                 return;
             }
@@ -161,6 +193,7 @@ namespace NoOfflineContainerFoodSpoil
         private void ClearPendingUnloadCatchup(double nowUnixSeconds, double nowWorldHours)
         {
             HasPendingUnloadCatchup = false;
+            suppressPendingUnloadCatchupWhileLoaded = false;
             LastUnloadCheckpointUnixSeconds = nowUnixSeconds;
             LastUnloadCheckpointWorldHours = nowWorldHours;
             Blockentity.MarkDirty();

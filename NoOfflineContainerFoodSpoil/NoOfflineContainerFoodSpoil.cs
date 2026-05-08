@@ -272,7 +272,7 @@ namespace NoOfflineContainerFoodSpoil
 
             foreach (BlockEntityBehaviorOfflinePreserve behavior in LoadedContainers.ToArray())
             {
-                behavior.SaveUnloadCheckpointIfNeeded();
+                behavior.SaveWorldSaveCheckpointIfNeeded();
             }
 
             LogDebug("World save finished.");
