@@ -1,3 +1,4 @@
+using HarmonyLib;
 using Newtonsoft.Json;
 using System;
 using System.Collections.Generic;
@@ -13,12 +14,20 @@ namespace NoOfflineContainerFoodSpoil
     public class NoOfflineContainerFoodSpoilModSystem : ModSystem
     {
         private const string ConfigFileName = "NoOfflineContainerFoodSpoil.json";
+        private const string PlayerSessionHistoryDataKey = "NoOfflineContainerFoodSpoil.PlayerSessionHistory";
+        private const double SessionHistoryFlushIntervalSeconds = 300;
 
-        // this feels risky, maybe some soft reference would be worth it? But maybe unsubscribe is good enough
+        private static bool harmonyPatched;
+
+        private readonly Dictionary<string, PersistedPlayerSessionHistory> playerSessionHistoriesByUid = [];
+        private readonly Dictionary<string, ActivePlayerSession> activePlayerSessionsByUid = [];
+        private readonly HashSet<string> dirtyPlayerSessionHistories = [];
+
         public HashSet<BlockEntityBehaviorOfflinePreserve> LoadedContainers { get; } = [];
+        internal Dictionary<InventoryBase, BlockEntityBehaviorOfflinePreserve> LoadedInventories { get; } = [];
         public NoOfflineContainerFoodSpoilConfig Config { get; private set; } = NoOfflineContainerFoodSpoilConfig.CreateDefault();
         internal ICoreServerAPI? ServerApi { get; private set; }
-        internal HashSet<BlockEntityBehaviorOfflinePreserve> WasModifiedThisTick = [];
+        internal HashSet<BlockEntityBehaviorOfflinePreserve> WasModifiedThisTick { get; } = [];
 
         public override void Start(ICoreAPI api)
         {
@@ -35,7 +44,23 @@ namespace NoOfflineContainerFoodSpoil
             NoOfflineContainerFoodSpoilCommands.Register(this, api);
             api.Event.DidPlaceBlock += OnDidPlaceBlock;
             api.Event.DidUseBlock += OnDidUseBlock;
+            api.Event.PlayerNowPlaying += OnPlayerNowPlaying;
+            api.Event.PlayerDisconnect += OnPlayerDisconnect;
+            api.Event.GameWorldSave += OnGameWorldSave;
             api.Event.RegisterGameTickListener(_ => OnTick(), 1);
+
+            PatchHarmony();
+        }
+
+        private void PatchHarmony()
+        {
+            if (harmonyPatched)
+            {
+                return;
+            }
+
+            new Harmony("NoOfflineContainerFoodSpoil.Catchup").PatchAll(typeof(NoOfflineContainerFoodSpoilHarmonyPatches).Assembly);
+            harmonyPatched = true;
         }
 
         private void OnTick()
@@ -47,16 +72,25 @@ namespace NoOfflineContainerFoodSpoil
         {
             base.AssetsFinalize(api);
 
-            foreach (var block in api.World.Blocks)
+            foreach (Block block in api.World.Blocks)
             {
-                if (block?.Code == null || block.EntityClass == null) continue;
+                if (block?.Code == null || block.EntityClass == null)
+                {
+                    continue;
+                }
 
                 Type entityType = api.ClassRegistry.GetBlockEntity(block.EntityClass);
                 bool isContainer = entityType != null && typeof(IBlockEntityContainer).IsAssignableFrom(entityType);
-                if (!isContainer) continue;
+                if (!isContainer)
+                {
+                    continue;
+                }
 
                 BlockEntityBehaviorType[] existingBehaviors = block.BlockEntityBehaviors ?? Array.Empty<BlockEntityBehaviorType>();
-                if (existingBehaviors.Any(behavior => behavior.Name == "OfflinePreserve")) continue;
+                if (existingBehaviors.Any(behavior => behavior.Name == "OfflinePreserve"))
+                {
+                    continue;
+                }
 
                 block.BlockEntityBehaviors = existingBehaviors
                     .Append(new BlockEntityBehaviorType { Name = "OfflinePreserve" })
@@ -96,34 +130,295 @@ namespace NoOfflineContainerFoodSpoil
             }
         }
 
+        internal void RegisterLoadedContainer(BlockEntityBehaviorOfflinePreserve behavior, InventoryBase inventory)
+        {
+            LoadedContainers.Add(behavior);
+            LoadedInventories[inventory] = behavior;
+        }
+
+        internal void UnregisterLoadedContainer(BlockEntityBehaviorOfflinePreserve behavior, InventoryBase inventory)
+        {
+            LoadedContainers.Remove(behavior);
+
+            if (LoadedInventories.TryGetValue(inventory, out BlockEntityBehaviorOfflinePreserve? mappedBehavior) && ReferenceEquals(mappedBehavior, behavior))
+            {
+                LoadedInventories.Remove(inventory);
+            }
+        }
+
+        internal bool TryGetLoadedBehavior(ItemSlot slot, out BlockEntityBehaviorOfflinePreserve? behavior)
+        {
+            behavior = null;
+            InventoryBase? inventory = slot.Inventory;
+            return inventory != null && LoadedInventories.TryGetValue(inventory, out behavior);
+        }
+
+        internal void TryReconcilePendingUnloadCatchup(IWorldAccessor world, ItemSlot slot)
+        {
+            if (world.Side != EnumAppSide.Server)
+            {
+                return;
+            }
+
+            if (TryGetLoadedBehavior(slot, out BlockEntityBehaviorOfflinePreserve? behavior))
+            {
+                behavior?.TryReconcilePendingUnloadCatchup(world);
+            }
+        }
+
         private void OnDidPlaceBlock(IServerPlayer player, int oldBlockId, BlockSelection blockSel, ItemStack stack)
         {
-            if (ServerApi is not { Side: EnumAppSide.Server }) return;
+            if (ServerApi is not { Side: EnumAppSide.Server })
+            {
+                return;
+            }
+
             BlockEntity? blockEntity = ServerApi.World.BlockAccessor.GetBlockEntity(blockSel.Position);
-            if (blockEntity is not BlockEntityContainer container) return;
+            if (blockEntity is not BlockEntityContainer container)
+            {
+                return;
+            }
+
             BlockEntityBehaviorOfflinePreserve? behavior = blockEntity.GetBehavior<BlockEntityBehaviorOfflinePreserve>();
-            if (behavior == null) return;
+            if (behavior == null)
+            {
+                return;
+            }
+
             behavior.SeedResident(player.PlayerUID);
             behavior.Init(container, ServerApi);
         }
 
         private void OnDidUseBlock(IServerPlayer player, BlockSelection blockSel)
         {
-            if (ServerApi is not { Side: EnumAppSide.Server }) return;
+            if (ServerApi is not { Side: EnumAppSide.Server })
+            {
+                return;
+            }
+
             BlockEntity? blockEntity = ServerApi.World.BlockAccessor.GetBlockEntity(blockSel.Position);
-            if (blockEntity is not BlockEntityContainer) return;
+            if (blockEntity is not BlockEntityContainer)
+            {
+                return;
+            }
+
             BlockEntityBehaviorOfflinePreserve? behavior = blockEntity.GetBehavior<BlockEntityBehaviorOfflinePreserve>();
-            if (behavior == null || !WasModifiedThisTick.Remove(behavior)) return;
+            if (behavior == null || !WasModifiedThisTick.Remove(behavior))
+            {
+                return;
+            }
+
             behavior.ProcessMeaningfulInteraction(player);
         }
+
+        private void OnPlayerNowPlaying(IServerPlayer player)
+        {
+            double nowUnixSeconds = GetUnixTimeSeconds();
+            double nowWorldHours = ServerApi?.World.Calendar.TotalHours ?? 0;
+
+            activePlayerSessionsByUid[player.PlayerUID] = new ActivePlayerSession
+            {
+                StartUnixSeconds = nowUnixSeconds,
+                StartWorldHours = nowWorldHours
+            };
+
+            MarkPlayerSessionHistoryDirty(player.PlayerUID);
+        }
+
+        private void OnPlayerDisconnect(IServerPlayer player)
+        {
+            if (!activePlayerSessionsByUid.TryGetValue(player.PlayerUID, out ActivePlayerSession? activeSession))
+            {
+                return;
+            }
+
+            double nowUnixSeconds = GetUnixTimeSeconds();
+            double nowWorldHours = ServerApi?.World.Calendar.TotalHours ?? 0;
+            PersistedPlayerSessionHistory history = GetOrLoadPersistedPlayerSessionHistory(player.PlayerUID);
+
+            history.Sessions.Add(new PlayerSessionEntry
+            {
+                StartUnixSeconds = activeSession.StartUnixSeconds,
+                EndUnixSeconds = nowUnixSeconds,
+                StartWorldHours = activeSession.StartWorldHours,
+                EndWorldHours = nowWorldHours
+            });
+
+            activePlayerSessionsByUid.Remove(player.PlayerUID);
+            MarkPlayerSessionHistoryDirty(player.PlayerUID);
+            FlushDirtyPlayerSessionHistories(includeActiveSessions: false);
+        }
+
+        private void OnGameWorldSave()
+        {
+            FlushDirtyPlayerSessionHistories(includeActiveSessions: true);
+
+            foreach (BlockEntityBehaviorOfflinePreserve behavior in LoadedContainers.ToArray())
+            {
+                behavior.SaveUnloadCheckpointIfNeeded();
+            }
+        }
+
+        private void MarkPlayerSessionHistoryDirty(string playerUid)
+        {
+            dirtyPlayerSessionHistories.Add(playerUid);
+        }
+
+        private PersistedPlayerSessionHistory GetOrLoadPersistedPlayerSessionHistory(string playerUid)
+        {
+            if (playerSessionHistoriesByUid.TryGetValue(playerUid, out PersistedPlayerSessionHistory? history))
+            {
+                return history;
+            }
+
+            PersistedPlayerSessionHistory loadedHistory = new PersistedPlayerSessionHistory();
+            IServerPlayerData? playerData = ServerApi?.PlayerData.GetPlayerDataByUid(playerUid);
+            if (playerData?.CustomPlayerData != null && playerData.CustomPlayerData.TryGetValue(PlayerSessionHistoryDataKey, out string? json) && !string.IsNullOrWhiteSpace(json))
+            {
+                try
+                {
+                    loadedHistory = JsonConvert.DeserializeObject<PersistedPlayerSessionHistory>(json) ?? new PersistedPlayerSessionHistory();
+                }
+                catch
+                {
+                    loadedHistory = new PersistedPlayerSessionHistory();
+                }
+            }
+
+            PrunePlayerSessionHistory(loadedHistory, GetUnixTimeSeconds());
+            playerSessionHistoriesByUid[playerUid] = loadedHistory;
+            return loadedHistory;
+        }
+
+        private void FlushDirtyPlayerSessionHistories(bool includeActiveSessions)
+        {
+            if (ServerApi == null)
+            {
+                return;
+            }
+
+            if (includeActiveSessions)
+            {
+                foreach (string playerUid in activePlayerSessionsByUid.Keys)
+                {
+                    dirtyPlayerSessionHistories.Add(playerUid);
+                }
+            }
+
+            double nowUnixSeconds = GetUnixTimeSeconds();
+            double nowWorldHours = ServerApi.World.Calendar.TotalHours;
+
+            foreach (string playerUid in dirtyPlayerSessionHistories.ToArray())
+            {
+                PersistedPlayerSessionHistory history = GetOrLoadPersistedPlayerSessionHistory(playerUid);
+                PrunePlayerSessionHistory(history, nowUnixSeconds);
+
+                List<PlayerSessionEntry> snapshotSessions = new List<PlayerSessionEntry>(history.Sessions);
+                if (activePlayerSessionsByUid.TryGetValue(playerUid, out ActivePlayerSession? activeSession))
+                {
+                    snapshotSessions.Add(new PlayerSessionEntry
+                    {
+                        StartUnixSeconds = activeSession.StartUnixSeconds,
+                        EndUnixSeconds = nowUnixSeconds,
+                        StartWorldHours = activeSession.StartWorldHours,
+                        EndWorldHours = nowWorldHours
+                    });
+                }
+
+                IServerPlayerData? playerData = ServerApi.PlayerData.GetPlayerDataByUid(playerUid);
+                if (playerData?.CustomPlayerData == null)
+                {
+                    continue;
+                }
+
+                string json = JsonConvert.SerializeObject(new PersistedPlayerSessionHistory { Sessions = snapshotSessions });
+                playerData.CustomPlayerData[PlayerSessionHistoryDataKey] = json;
+            }
+
+            dirtyPlayerSessionHistories.Clear();
+        }
+
+        private void PrunePlayerSessionHistory(PersistedPlayerSessionHistory history, double nowUnixSeconds)
+        {
+            double cutoffUnixSeconds = nowUnixSeconds - Config.SessionHistoryPruneRealDays * SecondsPerDay;
+            history.Sessions.RemoveAll(session => session.EndUnixSeconds < cutoffUnixSeconds);
+        }
+
+        internal List<PlayerSessionCoverageSegment> GetPlayerSessionCoverageSegments(string playerUid, double clipStartUnixSeconds, double clipEndUnixSeconds, double nowUnixSeconds, double nowWorldHours)
+        {
+            if (clipEndUnixSeconds <= clipStartUnixSeconds)
+            {
+                return [];
+            }
+
+            PersistedPlayerSessionHistory history = GetOrLoadPersistedPlayerSessionHistory(playerUid);
+            List<PlayerSessionEntry> sessions = new List<PlayerSessionEntry>(history.Sessions);
+
+            if (activePlayerSessionsByUid.TryGetValue(playerUid, out ActivePlayerSession? activeSession))
+            {
+                sessions.Add(new PlayerSessionEntry
+                {
+                    StartUnixSeconds = activeSession.StartUnixSeconds,
+                    EndUnixSeconds = nowUnixSeconds,
+                    StartWorldHours = activeSession.StartWorldHours,
+                    EndWorldHours = nowWorldHours
+                });
+            }
+
+            List<PlayerSessionCoverageSegment> coverageSegments = [];
+            foreach (PlayerSessionEntry session in sessions)
+            {
+                if (session.EndUnixSeconds <= clipStartUnixSeconds || session.StartUnixSeconds >= clipEndUnixSeconds)
+                {
+                    continue;
+                }
+
+                double overlapStartUnixSeconds = Math.Max(clipStartUnixSeconds, session.StartUnixSeconds);
+                double overlapEndUnixSeconds = Math.Min(clipEndUnixSeconds, session.EndUnixSeconds);
+                if (overlapEndUnixSeconds <= overlapStartUnixSeconds)
+                {
+                    continue;
+                }
+
+                coverageSegments.Add(new PlayerSessionCoverageSegment(
+                    overlapStartUnixSeconds,
+                    overlapEndUnixSeconds,
+                    InterpolateWorldHours(session, overlapStartUnixSeconds),
+                    InterpolateWorldHours(session, overlapEndUnixSeconds)
+                ));
+            }
+
+            return coverageSegments;
+        }
+
+        private static double InterpolateWorldHours(PlayerSessionEntry session, double unixSeconds)
+        {
+            double durationUnixSeconds = session.EndUnixSeconds - session.StartUnixSeconds;
+            if (durationUnixSeconds <= 0)
+            {
+                return session.EndWorldHours;
+            }
+
+            double ratio = (unixSeconds - session.StartUnixSeconds) / durationUnixSeconds;
+            return session.StartWorldHours + (session.EndWorldHours - session.StartWorldHours) * ratio;
+        }
+
+        internal static double GetUnixTimeSeconds()
+        {
+            return DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        }
+
+        private const double SecondsPerDay = 86400;
     }
 
     public sealed class BlockEntityBehaviorOfflinePreserve(BlockEntity blockEntity) : BlockEntityBehavior(blockEntity)
     {
         private const double TrackingCacheWindowSeconds = 30;
         private const string TrackedUsersTreeKey = "TrackedUsersJson";
+        private const string HasPendingUnloadCatchupTreeKey = "HasPendingUnloadCatchup";
+        private const string LastUnloadCheckpointUnixSecondsTreeKey = "LastUnloadCheckpointUnixSeconds";
+        private const string LastUnloadCheckpointWorldHoursTreeKey = "LastUnloadCheckpointWorldHours";
         private const double PresencePersistIntervalSeconds = 300;
-
         private float cachedPerishMultiplier = 1f;
         private bool cachedHasOnlineTrackedUser;
         private double cachedNextRefreshUnixSeconds;
@@ -131,13 +426,25 @@ namespace NoOfflineContainerFoodSpoil
 
         private NoOfflineContainerFoodSpoilModSystem? modSys;
         private string? legacyOwnerUid;
+        private bool isReconcilingPendingUnloadCatchup;
 
         private List<TrackedUserEntry> TrackedUsers { get; set; } = [];
+
+        private bool HasPendingUnloadCatchup { get; set; }
+        private double LastUnloadCheckpointUnixSeconds { get; set; }
+        private double LastUnloadCheckpointWorldHours { get; set; }
+
+        internal bool HasPendingUnloadCatchupForCommand => HasPendingUnloadCatchup;
+        internal double LastUnloadCheckpointUnixSecondsForCommand => LastUnloadCheckpointUnixSeconds;
+        internal double LastUnloadCheckpointWorldHoursForCommand => LastUnloadCheckpointWorldHours;
 
         public override void ToTreeAttributes(ITreeAttribute tree)
         {
             base.ToTreeAttributes(tree);
             tree.SetString(TrackedUsersTreeKey, JsonConvert.SerializeObject(TrackedUsers));
+            tree.SetBool(HasPendingUnloadCatchupTreeKey, HasPendingUnloadCatchup);
+            tree.SetDouble(LastUnloadCheckpointUnixSecondsTreeKey, LastUnloadCheckpointUnixSeconds);
+            tree.SetDouble(LastUnloadCheckpointWorldHoursTreeKey, LastUnloadCheckpointWorldHours);
         }
 
         public override void FromTreeAttributes(ITreeAttribute tree, IWorldAccessor worldAccessor)
@@ -145,6 +452,9 @@ namespace NoOfflineContainerFoodSpoil
             base.FromTreeAttributes(tree, worldAccessor);
 
             legacyOwnerUid = tree.GetString("OwnerUID");
+            HasPendingUnloadCatchup = tree.GetBool(HasPendingUnloadCatchupTreeKey);
+            LastUnloadCheckpointUnixSeconds = tree.GetDouble(LastUnloadCheckpointUnixSecondsTreeKey);
+            LastUnloadCheckpointWorldHours = tree.GetDouble(LastUnloadCheckpointWorldHoursTreeKey);
 
             string trackedUsersJson = tree.GetString(TrackedUsersTreeKey);
             if (string.IsNullOrWhiteSpace(trackedUsersJson))
@@ -174,7 +484,7 @@ namespace NoOfflineContainerFoodSpoil
 
             Init(container, api);
         }
-        
+
         internal void Init(BlockEntityContainer container, ICoreAPI api)
         {
             modSys = api.ModLoader.GetModSystem<NoOfflineContainerFoodSpoilModSystem>();
@@ -188,7 +498,7 @@ namespace NoOfflineContainerFoodSpoil
             container.Inventory.SlotModified -= OnSlotModified;
             container.Inventory.SlotModified += OnSlotModified;
 
-            modSys.LoadedContainers.Add(this);
+            modSys.RegisterLoadedContainer(this, container.Inventory);
             MigrateLegacyOwnerIfNeeded();
             RefreshTrackingCache(forcePersist: true);
         }
@@ -201,6 +511,7 @@ namespace NoOfflineContainerFoodSpoil
 
         public override void OnBlockUnloaded()
         {
+            SaveUnloadCheckpointIfNeeded();
             base.OnBlockUnloaded();
             Unsubscribe();
         }
@@ -212,11 +523,11 @@ namespace NoOfflineContainerFoodSpoil
                 return;
             }
 
-            double now = GetUnixTimeSeconds();
+            double nowUnixSeconds = NoOfflineContainerFoodSpoilModSystem.GetUnixTimeSeconds();
             TrackedUserEntry entry = GetOrCreateEntry(playerUid);
             entry.State = TrackedUserState.Resident;
-            entry.LastMeaningfulInteractionUnixSeconds = now;
-            entry.LastResidentPresenceUnixSeconds = now;
+            entry.LastMeaningfulInteractionUnixSeconds = nowUnixSeconds;
+            entry.LastResidentPresenceUnixSeconds = nowUnixSeconds;
             entry.LastProvisionalInteractionUnixSeconds = 0;
 
             MarkTrackingDirty();
@@ -228,7 +539,7 @@ namespace NoOfflineContainerFoodSpoil
             TrackedUserEntry? entry = FindEntry(player.PlayerUID);
             if (entry?.State == TrackedUserState.Resident)
             {
-                entry.LastResidentPresenceUnixSeconds = GetUnixTimeSeconds();
+                entry.LastResidentPresenceUnixSeconds = NoOfflineContainerFoodSpoilModSystem.GetUnixTimeSeconds();
                 MarkTrackingDirty();
                 Blockentity.MarkDirty();
             }
@@ -236,14 +547,21 @@ namespace NoOfflineContainerFoodSpoil
 
         private void OnSlotModified(int slotId)
         {
-            if (AttributeMeaningfulInteractionToOpenViewers()) return;
+            if (AttributeMeaningfulInteractionToOpenViewers())
+            {
+                return;
+            }
+
             modSys?.WasModifiedThisTick.Add(this);
         }
 
         private float OnAcquireTransitionSpeed(EnumTransitionType transType, ItemStack stack, float baseMul)
         {
-            // TODO: this method is heavily cached as the game seems to execute it basically every tick?
-            //   currently the cache is 30 seconds, but maybe its worth randomizing it a bit to avoid all chests expiring at the same time?
+            if (transType != EnumTransitionType.Perish)
+            {
+                return baseMul;
+            }
+
             EnsureTrackingCacheCurrent();
             return cachedHasOnlineTrackedUser ? baseMul : baseMul * cachedPerishMultiplier;
         }
@@ -256,10 +574,10 @@ namespace NoOfflineContainerFoodSpoil
                 return false;
             }
 
-            double now = GetUnixTimeSeconds();
+            double nowUnixSeconds = NoOfflineContainerFoodSpoilModSystem.GetUnixTimeSeconds();
             foreach (string playerUid in openViewerUids)
             {
-                ProcessMeaningfulInteraction(playerUid, now);
+                ProcessMeaningfulInteraction(playerUid, nowUnixSeconds);
             }
 
             MarkTrackingDirty();
@@ -269,40 +587,40 @@ namespace NoOfflineContainerFoodSpoil
 
         public void ProcessMeaningfulInteraction(IPlayer player)
         {
-            double now = GetUnixTimeSeconds();
-            ProcessMeaningfulInteraction(player.PlayerUID, now);
-            
+            double nowUnixSeconds = NoOfflineContainerFoodSpoilModSystem.GetUnixTimeSeconds();
+            ProcessMeaningfulInteraction(player.PlayerUID, nowUnixSeconds);
+
             MarkTrackingDirty();
             RefreshTrackingCache(forcePersist: true);
         }
 
-        private void ProcessMeaningfulInteraction(string playerUid, double now)
+        private void ProcessMeaningfulInteraction(string playerUid, double nowUnixSeconds)
         {
             TrackedUserEntry entry = GetOrCreateEntry(playerUid);
 
             if (entry.State == TrackedUserState.Resident)
             {
-                entry.LastMeaningfulInteractionUnixSeconds = now;
-                entry.LastResidentPresenceUnixSeconds = now;
+                entry.LastMeaningfulInteractionUnixSeconds = nowUnixSeconds;
+                entry.LastResidentPresenceUnixSeconds = nowUnixSeconds;
                 return;
             }
 
             double promotionWindowSeconds = GetConfig().PromotionWindowRealDays * SecondsPerDay;
             bool withinPromotionWindow = entry.LastProvisionalInteractionUnixSeconds > 0
-                && now - entry.LastProvisionalInteractionUnixSeconds <= promotionWindowSeconds;
+                && nowUnixSeconds - entry.LastProvisionalInteractionUnixSeconds <= promotionWindowSeconds;
 
             if (withinPromotionWindow)
             {
                 entry.State = TrackedUserState.Resident;
-                entry.LastMeaningfulInteractionUnixSeconds = now;
-                entry.LastResidentPresenceUnixSeconds = now;
+                entry.LastMeaningfulInteractionUnixSeconds = nowUnixSeconds;
+                entry.LastResidentPresenceUnixSeconds = nowUnixSeconds;
                 entry.LastProvisionalInteractionUnixSeconds = 0;
                 return;
             }
 
             entry.State = TrackedUserState.Provisional;
-            entry.LastMeaningfulInteractionUnixSeconds = now;
-            entry.LastProvisionalInteractionUnixSeconds = now;
+            entry.LastMeaningfulInteractionUnixSeconds = nowUnixSeconds;
+            entry.LastProvisionalInteractionUnixSeconds = nowUnixSeconds;
         }
 
         private void MigrateLegacyOwnerIfNeeded()
@@ -318,8 +636,8 @@ namespace NoOfflineContainerFoodSpoil
 
         private void EnsureTrackingCacheCurrent()
         {
-            double now = GetUnixTimeSeconds();
-            if (!trackingDirty && now < cachedNextRefreshUnixSeconds)
+            double nowUnixSeconds = NoOfflineContainerFoodSpoilModSystem.GetUnixTimeSeconds();
+            if (!trackingDirty && nowUnixSeconds < cachedNextRefreshUnixSeconds)
             {
                 return;
             }
@@ -329,20 +647,20 @@ namespace NoOfflineContainerFoodSpoil
 
         private void RefreshTrackingCache(bool forcePersist)
         {
-            double now = GetUnixTimeSeconds();
+            double nowUnixSeconds = NoOfflineContainerFoodSpoilModSystem.GetUnixTimeSeconds();
             bool changed = forcePersist;
             bool hasOnlineTrackedUser = false;
             NoOfflineContainerFoodSpoilConfig config = GetConfig();
             TrackedUserEntry? pinnedResident = GetPinnedResident();
             List<TrackedUserEntry>? entriesToRemove = null;
 
-            foreach (var entry in TrackedUsers)
+            foreach (TrackedUserEntry entry in TrackedUsers)
             {
-                RuntimeTrackedUserState state = EvaluateRuntimeState(entry, now, config);
+                RuntimeTrackedUserState state = EvaluateRuntimeState(entry, nowUnixSeconds, config);
 
                 if (state.RefreshResidentPresence)
                 {
-                    entry.LastResidentPresenceUnixSeconds = now;
+                    entry.LastResidentPresenceUnixSeconds = nowUnixSeconds;
                     changed = true;
                 }
 
@@ -353,7 +671,7 @@ namespace NoOfflineContainerFoodSpoil
 
                 if (state.RemoveFromTracking && !ReferenceEquals(entry, pinnedResident))
                 {
-                    entriesToRemove ??= new List<TrackedUserEntry>();
+                    entriesToRemove ??= [];
                     entriesToRemove.Add(entry);
                 }
             }
@@ -389,7 +707,7 @@ namespace NoOfflineContainerFoodSpoil
 
             cachedHasOnlineTrackedUser = hasOnlineTrackedUser;
             cachedPerishMultiplier = config.OfflineSpoilageMultiplier;
-            cachedNextRefreshUnixSeconds = now + TrackingCacheWindowSeconds;
+            cachedNextRefreshUnixSeconds = nowUnixSeconds + TrackingCacheWindowSeconds;
             trackingDirty = false;
 
             if (changed)
@@ -452,16 +770,229 @@ namespace NoOfflineContainerFoodSpoil
             return true;
         }
 
+        internal void SaveUnloadCheckpointIfNeeded()
+        {
+            if (isReconcilingPendingUnloadCatchup || modSys?.ServerApi == null || Blockentity is not BlockEntityContainer container)
+            {
+                return;
+            }
+
+            bool hasPerishableStacks = false;
+            foreach (ItemSlot slot in container.Inventory)
+            {
+                if (!HasPerishTransition(slot, modSys.ServerApi.World))
+                {
+                    continue;
+                }
+
+                hasPerishableStacks = true;
+                slot.Itemstack!.Collectible.UpdateAndGetTransitionState(modSys.ServerApi.World, slot, EnumTransitionType.Perish);
+            }
+
+            LastUnloadCheckpointUnixSeconds = NoOfflineContainerFoodSpoilModSystem.GetUnixTimeSeconds();
+            LastUnloadCheckpointWorldHours = modSys.ServerApi.World.Calendar.TotalHours;
+            HasPendingUnloadCatchup = hasPerishableStacks;
+            Blockentity.MarkDirty();
+        }
+
+        internal void TryReconcilePendingUnloadCatchup(IWorldAccessor world)
+        {
+            if (!HasPendingUnloadCatchup || isReconcilingPendingUnloadCatchup || modSys?.ServerApi == null || Blockentity is not BlockEntityContainer container)
+            {
+                return;
+            }
+
+            double nowUnixSeconds = NoOfflineContainerFoodSpoilModSystem.GetUnixTimeSeconds();
+            double nowWorldHours = world.Calendar.TotalHours;
+            if (LastUnloadCheckpointUnixSeconds <= 0 || nowUnixSeconds <= LastUnloadCheckpointUnixSeconds || nowWorldHours <= LastUnloadCheckpointWorldHours)
+            {
+                ClearPendingUnloadCatchup(nowUnixSeconds, nowWorldHours);
+                return;
+            }
+
+            isReconcilingPendingUnloadCatchup = true;
+
+            try
+            {
+                float effectivePerishWorldHours = ComputeEffectivePerishWorldHours(nowUnixSeconds, nowWorldHours);
+                foreach (ItemSlot slot in container.Inventory)
+                {
+                    ApplyPendingUnloadCatchupToSlot(slot, world, effectivePerishWorldHours);
+                }
+
+                ClearPendingUnloadCatchup(nowUnixSeconds, nowWorldHours);
+            }
+            finally
+            {
+                isReconcilingPendingUnloadCatchup = false;
+            }
+        }
+
+        private void ClearPendingUnloadCatchup(double nowUnixSeconds, double nowWorldHours)
+        {
+            HasPendingUnloadCatchup = false;
+            LastUnloadCheckpointUnixSeconds = nowUnixSeconds;
+            LastUnloadCheckpointWorldHours = nowWorldHours;
+            Blockentity.MarkDirty();
+        }
+
+        private float ComputeEffectivePerishWorldHours(double nowUnixSeconds, double nowWorldHours)
+        {
+            double totalGapWorldHours = Math.Max(0, nowWorldHours - LastUnloadCheckpointWorldHours);
+            double clipStartUnixSeconds = LastUnloadCheckpointUnixSeconds;
+            double clipEndUnixSeconds = nowUnixSeconds;
+            NoOfflineContainerFoodSpoilConfig config = GetConfig();
+            List<PlayerSessionCoverageSegment> coverageSegments = [];
+
+            foreach (TrackedUserEntry entry in TrackedUsers)
+            {
+                double eligibilityEndUnixSeconds = GetUnloadCatchupEligibilityEndUnixSeconds(entry, config);
+                double clippedEligibilityEndUnixSeconds = Math.Min(clipEndUnixSeconds, eligibilityEndUnixSeconds);
+                if (clippedEligibilityEndUnixSeconds <= clipStartUnixSeconds)
+                {
+                    continue;
+                }
+
+                coverageSegments.AddRange(modSys!.GetPlayerSessionCoverageSegments(entry.PlayerUid, clipStartUnixSeconds, clippedEligibilityEndUnixSeconds, nowUnixSeconds, nowWorldHours));
+            }
+
+            double countedOnlineWorldHours = Math.Min(totalGapWorldHours, CalculateUnionWorldHours(coverageSegments));
+            double offlineWorldHours = Math.Max(0, totalGapWorldHours - countedOnlineWorldHours);
+            return (float)(countedOnlineWorldHours + offlineWorldHours * config.OfflineSpoilageMultiplier);
+        }
+
+        private double GetUnloadCatchupEligibilityEndUnixSeconds(TrackedUserEntry entry, NoOfflineContainerFoodSpoilConfig config)
+        {
+            if (entry.State == TrackedUserState.Provisional)
+            {
+                return entry.LastProvisionalInteractionUnixSeconds + config.ProvisionalExpiryRealHours * SecondsPerHour;
+            }
+
+            double referenceUnixSeconds = GetEntryReferenceTime(entry);
+            double residentWindowSeconds = Math.Min(config.ResidentExpiryRealDays * SecondsPerDay, config.FarAwayExpiryRealHours * SecondsPerHour);
+            return referenceUnixSeconds + residentWindowSeconds;
+        }
+
+        private static double CalculateUnionWorldHours(List<PlayerSessionCoverageSegment> coverageSegments)
+        {
+            if (coverageSegments.Count == 0)
+            {
+                return 0;
+            }
+
+            List<double> breakpoints = coverageSegments
+                .SelectMany(segment => new[] { segment.StartUnixSeconds, segment.EndUnixSeconds })
+                .Distinct()
+                .OrderBy(value => value)
+                .ToList();
+
+            double unionWorldHours = 0;
+
+            for (int index = 0; index < breakpoints.Count - 1; index++)
+            {
+                double segmentStartUnixSeconds = breakpoints[index];
+                double segmentEndUnixSeconds = breakpoints[index + 1];
+                if (segmentEndUnixSeconds <= segmentStartUnixSeconds)
+                {
+                    continue;
+                }
+
+                PlayerSessionCoverageSegment? coverage = coverageSegments.FirstOrDefault(segment =>
+                    segment.StartUnixSeconds <= segmentStartUnixSeconds && segment.EndUnixSeconds >= segmentEndUnixSeconds);
+
+                if (coverage == null)
+                {
+                    continue;
+                }
+
+                unionWorldHours += InterpolateWorldHours(coverage.Value, segmentEndUnixSeconds) - InterpolateWorldHours(coverage.Value, segmentStartUnixSeconds);
+            }
+
+            return unionWorldHours;
+        }
+
+        private static double InterpolateWorldHours(PlayerSessionCoverageSegment coverageSegment, double unixSeconds)
+        {
+            double durationUnixSeconds = coverageSegment.EndUnixSeconds - coverageSegment.StartUnixSeconds;
+            if (durationUnixSeconds <= 0)
+            {
+                return coverageSegment.EndWorldHours;
+            }
+
+            double ratio = (unixSeconds - coverageSegment.StartUnixSeconds) / durationUnixSeconds;
+            return coverageSegment.StartWorldHours + (coverageSegment.EndWorldHours - coverageSegment.StartWorldHours) * ratio;
+        }
+
+        private void ApplyPendingUnloadCatchupToSlot(ItemSlot slot, IWorldAccessor world, float effectivePerishWorldHours)
+        {
+            if (!HasPerishTransition(slot, world))
+            {
+                return;
+            }
+
+            ItemStack stack = slot.Itemstack!;
+            TransitionableProperties[]? transitionProps = stack.Collectible.GetTransitionableProperties(world, stack, null);
+            if (transitionProps == null || !TryGetPerishTransitionStateData(stack, transitionProps, out ITreeAttribute? attr, out float[]? transitionedHours, out int perishIndex))
+            {
+                return;
+            }
+
+            transitionedHours![perishIndex] += effectivePerishWorldHours;
+            attr!.SetDouble("lastUpdatedTotalHours", world.Calendar.TotalHours);
+
+            stack.Collectible.UpdateAndGetTransitionState(world, slot, EnumTransitionType.Perish);
+        }
+
+        private static bool TryGetPerishTransitionStateData(ItemStack stack, TransitionableProperties[] transitionProps, out ITreeAttribute? attr, out float[]? transitionedHours, out int perishIndex)
+        {
+            attr = stack.Attributes?["transitionstate"] as ITreeAttribute;
+            transitionedHours = null;
+            perishIndex = -1;
+
+            if (attr == null)
+            {
+                return false;
+            }
+
+            for (int index = 0; index < transitionProps.Length; index++)
+            {
+                if (transitionProps[index]?.Type == EnumTransitionType.Perish)
+                {
+                    perishIndex = index;
+                    break;
+                }
+            }
+
+            if (perishIndex < 0)
+            {
+                return false;
+            }
+
+            transitionedHours = (attr["transitionedHours"] as FloatArrayAttribute)?.value;
+            return transitionedHours != null && perishIndex < transitionedHours.Length;
+        }
+
+        private static bool HasPerishTransition(ItemSlot slot, IWorldAccessor world)
+        {
+            if (slot.Itemstack == null)
+            {
+                return false;
+            }
+
+            TransitionableProperties[]? transitionProps = slot.Itemstack.Collectible.GetTransitionableProperties(world, slot.Itemstack, null);
+            return transitionProps != null && transitionProps.Any(prop => prop?.Type == EnumTransitionType.Perish);
+        }
+
         private ContainerTrackingState EvaluateTrackedUsersForDebug()
         {
-            double now = GetUnixTimeSeconds();
+            double nowUnixSeconds = NoOfflineContainerFoodSpoilModSystem.GetUnixTimeSeconds();
             NoOfflineContainerFoodSpoilConfig config = GetConfig();
             List<TrackedUserStatus> states = new List<TrackedUserStatus>(TrackedUsers.Count);
             bool hasValidTrackedUser = false;
 
             foreach (TrackedUserEntry entry in TrackedUsers)
             {
-                TrackedUserStatus state = BuildDebugState(entry, now, config);
+                TrackedUserStatus state = BuildDebugState(entry, nowUnixSeconds, config);
                 states.Add(state);
                 hasValidTrackedUser |= state.CountsForSpoilage;
             }
@@ -473,13 +1004,13 @@ namespace NoOfflineContainerFoodSpoil
             };
         }
 
-        private RuntimeTrackedUserState EvaluateRuntimeState(TrackedUserEntry entry, double now, NoOfflineContainerFoodSpoilConfig config)
+        private RuntimeTrackedUserState EvaluateRuntimeState(TrackedUserEntry entry, double nowUnixSeconds, NoOfflineContainerFoodSpoilConfig config)
         {
             if (entry.State == TrackedUserState.Provisional)
             {
                 IPlayer? player = GetOnlinePlayer(entry.PlayerUid);
                 bool online = player != null;
-                double provisionalAgeSeconds = Math.Max(0, now - entry.LastProvisionalInteractionUnixSeconds);
+                double provisionalAgeSeconds = Math.Max(0, nowUnixSeconds - entry.LastProvisionalInteractionUnixSeconds);
                 bool withinTimeWindow = provisionalAgeSeconds <= config.ProvisionalExpiryRealHours * SecondsPerHour;
 
                 return new RuntimeTrackedUserState(
@@ -506,15 +1037,15 @@ namespace NoOfflineContainerFoodSpoil
             if (withinKeepaliveRadius)
             {
                 double previousPresence = entry.LastResidentPresenceUnixSeconds;
-                if (now - previousPresence >= PresencePersistIntervalSeconds)
+                if (nowUnixSeconds - previousPresence >= PresencePersistIntervalSeconds)
                 {
                     refreshResidentPresence = true;
                 }
 
-                referenceTime = now;
+                referenceTime = nowUnixSeconds;
             }
 
-            double residentAgeSeconds = Math.Max(0, now - referenceTime);
+            double residentAgeSeconds = Math.Max(0, nowUnixSeconds - referenceTime);
             bool withinTrackingWindow = residentAgeSeconds <= thresholdSeconds;
 
             return new RuntimeTrackedUserState(
@@ -524,17 +1055,14 @@ namespace NoOfflineContainerFoodSpoil
             );
         }
 
-        private TrackedUserStatus BuildDebugState(TrackedUserEntry entry, double now, NoOfflineContainerFoodSpoilConfig config)
+        private TrackedUserStatus BuildDebugState(TrackedUserEntry entry, double nowUnixSeconds, NoOfflineContainerFoodSpoilConfig config)
         {
-            if (entry.State == TrackedUserState.Provisional)
-            {
-                return BuildProvisionalDebugState(entry, now, config);
-            }
-
-            return BuildResidentDebugState(entry, now, config);
+            return entry.State == TrackedUserState.Provisional
+                ? BuildProvisionalDebugState(entry, nowUnixSeconds, config)
+                : BuildResidentDebugState(entry, nowUnixSeconds, config);
         }
 
-        private TrackedUserStatus BuildResidentDebugState(TrackedUserEntry entry, double now, NoOfflineContainerFoodSpoilConfig config)
+        private TrackedUserStatus BuildResidentDebugState(TrackedUserEntry entry, double nowUnixSeconds, NoOfflineContainerFoodSpoilConfig config)
         {
             IPlayer? player = GetOnlinePlayer(entry.PlayerUid);
             double? distance = GetDistanceToContainer(player);
@@ -545,7 +1073,7 @@ namespace NoOfflineContainerFoodSpoil
 
             if (withinKeepaliveRadius)
             {
-                referenceTime = now;
+                referenceTime = nowUnixSeconds;
             }
 
             double thresholdSeconds = config.ResidentExpiryRealDays * SecondsPerDay;
@@ -561,7 +1089,7 @@ namespace NoOfflineContainerFoodSpoil
                 reason = "resident-online-far-away";
             }
 
-            double ageSeconds = Math.Max(0, now - referenceTime);
+            double ageSeconds = Math.Max(0, nowUnixSeconds - referenceTime);
             bool withinTrackingWindow = ageSeconds <= thresholdSeconds;
             bool countsForSpoilage = online && withinTrackingWindow;
             bool removeFromTracking = !withinTrackingWindow;
@@ -579,17 +1107,17 @@ namespace NoOfflineContainerFoodSpoil
                 RemoveFromTracking = removeFromTracking,
                 Reason = countsForSpoilage
                     ? reason
-                    : (removeFromTracking ? $"{reason}-expired" : $"{reason}-not-counting")
+                    : removeFromTracking ? $"{reason}-expired" : $"{reason}-not-counting"
             };
         }
 
-        private TrackedUserStatus BuildProvisionalDebugState(TrackedUserEntry entry, double now, NoOfflineContainerFoodSpoilConfig config)
+        private TrackedUserStatus BuildProvisionalDebugState(TrackedUserEntry entry, double nowUnixSeconds, NoOfflineContainerFoodSpoilConfig config)
         {
             IPlayer? player = GetOnlinePlayer(entry.PlayerUid);
             double? distance = GetDistanceToContainer(player);
             bool online = player != null;
             double thresholdSeconds = config.ProvisionalExpiryRealHours * SecondsPerHour;
-            double ageSeconds = Math.Max(0, now - entry.LastProvisionalInteractionUnixSeconds);
+            double ageSeconds = Math.Max(0, nowUnixSeconds - entry.LastProvisionalInteractionUnixSeconds);
             bool withinTimeWindow = ageSeconds <= thresholdSeconds;
 
             return new TrackedUserStatus
@@ -623,14 +1151,14 @@ namespace NoOfflineContainerFoodSpoil
         {
             if (Blockentity is not BlockEntityContainer container)
             {
-                return new List<string>();
+                return [];
             }
 
             return container.Inventory.openedByPlayerGUIds?
                 .Where(uid => !string.IsNullOrWhiteSpace(uid))
                 .Distinct()
                 .OrderBy(uid => uid)
-                .ToList() ?? new List<string>();
+                .ToList() ?? [];
         }
 
         private IPlayer? GetOnlinePlayer(string playerUid)
@@ -641,12 +1169,17 @@ namespace NoOfflineContainerFoodSpoil
                 return null;
             }
 
-            return api.World.PlayerByUid(playerUid) is IServerPlayer { Entity: not null, ConnectionState: EnumClientState.Playing } player ? player : null;
+            return api.World.PlayerByUid(playerUid) is IServerPlayer { Entity: not null, ConnectionState: EnumClientState.Playing } player
+                ? player
+                : null;
         }
 
         private double? GetDistanceToContainer(IPlayer? player)
         {
-            if (player?.Entity?.Pos == null) return null;
+            if (player?.Entity?.Pos == null)
+            {
+                return null;
+            }
 
             double dx = player.Entity.Pos.X - (Blockentity.Pos.X + 0.5);
             double dy = player.Entity.Pos.Y - (Blockentity.Pos.Y + 0.5);
@@ -684,10 +1217,9 @@ namespace NoOfflineContainerFoodSpoil
             {
                 container.Inventory.OnAcquireTransitionSpeed -= OnAcquireTransitionSpeed;
                 container.Inventory.OnInventoryOpened -= OnInventoryOpened;
-                container.Inventory.SlotModified -=  OnSlotModified;
+                container.Inventory.SlotModified -= OnSlotModified;
+                modSys?.UnregisterLoadedContainer(this, container.Inventory);
             }
-
-            modSys?.LoadedContainers.Remove(this);
         }
 
         private static double GetEntryReferenceTime(TrackedUserEntry entry)
@@ -695,14 +1227,8 @@ namespace NoOfflineContainerFoodSpoil
             return Math.Max(entry.LastMeaningfulInteractionUnixSeconds, entry.LastResidentPresenceUnixSeconds);
         }
 
-        private static double GetUnixTimeSeconds()
-        {
-            return DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        }
-
         private const double SecondsPerHour = 3600;
         private const double SecondsPerDay = 86400;
-
     }
 
     public enum TrackedUserState
@@ -738,6 +1264,33 @@ namespace NoOfflineContainerFoodSpoil
     {
         public List<TrackedUserStatus> UserStates { get; init; } = [];
         public bool HasValidTrackedUser { get; init; }
+    }
+
+    internal sealed class PlayerSessionEntry
+    {
+        public double StartUnixSeconds;
+        public double EndUnixSeconds;
+        public double StartWorldHours;
+        public double EndWorldHours;
+    }
+
+    internal sealed class PersistedPlayerSessionHistory
+    {
+        public List<PlayerSessionEntry> Sessions { get; set; } = [];
+    }
+
+    internal sealed class ActivePlayerSession
+    {
+        public double StartUnixSeconds;
+        public double StartWorldHours;
+    }
+
+    internal readonly struct PlayerSessionCoverageSegment(double startUnixSeconds, double endUnixSeconds, double startWorldHours, double endWorldHours)
+    {
+        public double StartUnixSeconds { get; } = startUnixSeconds;
+        public double EndUnixSeconds { get; } = endUnixSeconds;
+        public double StartWorldHours { get; } = startWorldHours;
+        public double EndWorldHours { get; } = endWorldHours;
     }
 
     internal readonly struct RuntimeTrackedUserState(bool countsForSpoilage, bool removeFromTracking, bool refreshResidentPresence)

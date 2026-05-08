@@ -20,6 +20,8 @@ namespace NoOfflineContainerFoodSpoil
         public double FarAwayRadiusBlocks = 250;
         // After how many real-time hours of inactivity a player considered one of chest owners (resident) will be forgotten if they are outside their house. (the last player is never removed)
         public double FarAwayExpiryRealHours = 24;
+        // How much recent player online history is kept to reconstruct spoilage catch-up for unloaded containers.
+        public double SessionHistoryPruneRealDays = 30;
 
         public static NoOfflineContainerFoodSpoilConfig CreateDefault()
         {
@@ -36,6 +38,7 @@ namespace NoOfflineContainerFoodSpoil
             PromotionWindowRealDays = Math.Max(0.01, PromotionWindowRealDays);
             FarAwayRadiusBlocks = Math.Max(ResidentKeepaliveRadiusBlocks, FarAwayRadiusBlocks);
             FarAwayExpiryRealHours = Math.Max(0.01, FarAwayExpiryRealHours);
+            SessionHistoryPruneRealDays = Math.Max(0.01, SessionHistoryPruneRealDays);
         }
     }
 }

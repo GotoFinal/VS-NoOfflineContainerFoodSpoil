@@ -297,6 +297,7 @@ namespace NoOfflineContainerFoodSpoil
             builder.AppendLine($"  PromotionWindowRealDays={FormatDouble(config.PromotionWindowRealDays)}");
             builder.AppendLine($"  FarAwayRadiusBlocks={FormatDouble(config.FarAwayRadiusBlocks)}");
             builder.AppendLine($"  FarAwayExpiryRealHours={FormatDouble(config.FarAwayExpiryRealHours)}");
+            builder.AppendLine($"  SessionHistoryPruneRealDays={FormatDouble(config.SessionHistoryPruneRealDays)}");
             return builder.ToString().TrimEnd();
         }
 
@@ -330,6 +331,9 @@ namespace NoOfflineContainerFoodSpoil
                     return true;
                 case "farawayexpiryrealhours":
                     value = $"FarAwayExpiryRealHours={FormatDouble(config.FarAwayExpiryRealHours)}";
+                    return true;
+                case "sessionhistoryprunerealdays":
+                    value = $"SessionHistoryPruneRealDays={FormatDouble(config.SessionHistoryPruneRealDays)}";
                     return true;
                 default:
                     error = $"Unknown setting '{setting}'.";
@@ -383,6 +387,8 @@ namespace NoOfflineContainerFoodSpoil
                     return TrySetDouble(rawValue, setting, nameof(config.FarAwayRadiusBlocks), value => config.FarAwayRadiusBlocks = value, () => config.FarAwayRadiusBlocks, config, out canonicalName, out formattedValue, out error);
                 case "farawayexpiryrealhours":
                     return TrySetDouble(rawValue, setting, nameof(config.FarAwayExpiryRealHours), value => config.FarAwayExpiryRealHours = value, () => config.FarAwayExpiryRealHours, config, out canonicalName, out formattedValue, out error);
+                case "sessionhistoryprunerealdays":
+                    return TrySetDouble(rawValue, setting, nameof(config.SessionHistoryPruneRealDays), value => config.SessionHistoryPruneRealDays = value, () => config.SessionHistoryPruneRealDays, config, out canonicalName, out formattedValue, out error);
                 default:
                     error = $"Unknown setting '{setting}'.";
                     return false;
@@ -425,7 +431,7 @@ namespace NoOfflineContainerFoodSpoil
 
         private static string GetSupportedSettingsSummary()
         {
-            return "TrackedPlayerLimit, OfflineSpoilageMultiplier, ResidentExpiryRealDays, ResidentKeepaliveRadiusBlocks, ProvisionalExpiryRealHours, PromotionWindowRealDays, FarAwayRadiusBlocks, FarAwayExpiryRealHours";
+            return "TrackedPlayerLimit, OfflineSpoilageMultiplier, ResidentExpiryRealDays, ResidentKeepaliveRadiusBlocks, ProvisionalExpiryRealHours, PromotionWindowRealDays, FarAwayRadiusBlocks, FarAwayExpiryRealHours, SessionHistoryPruneRealDays";
         }
 
         private static string FormatInt(int value)
@@ -468,6 +474,9 @@ namespace NoOfflineContainerFoodSpoil
             builder.AppendLine($"Spoilage mode: {(snapshot.HasValidTrackedUser ? "normal" : "slowed")}");
             builder.AppendLine($"Applied perish multiplier: {(snapshot.HasValidTrackedUser ? 1f : config.OfflineSpoilageMultiplier):0.###}");
             builder.AppendLine($"Reason: {primaryReason}");
+            builder.AppendLine($"PendingUnloadCatchup={behavior.HasPendingUnloadCatchupForCommand}");
+            builder.AppendLine($"LastUnloadCheckpoint={FormatUnixSeconds(behavior.LastUnloadCheckpointUnixSecondsForCommand)}");
+            builder.AppendLine($"LastUnloadCheckpointWorldHours={FormatDouble(behavior.LastUnloadCheckpointWorldHoursForCommand)}");
             builder.AppendLine($"Open viewers: {(openViewerUids.Count == 0 ? "(none)" : string.Join(", ", openViewerUids.OrderBy(uid => uid).Select(uid => FormatPlayerIdentity(uid, ResolvePlayerDisplayName(modSystem, uid)))))}");
             builder.AppendLine(BuildConfigDump(config));
             builder.AppendLine("Tracked users:");
