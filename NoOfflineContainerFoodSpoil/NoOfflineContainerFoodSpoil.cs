@@ -18,6 +18,7 @@ namespace NoOfflineContainerFoodSpoil
         public HashSet<BlockEntityBehaviorOfflinePreserve> LoadedContainers { get; } = [];
         public NoOfflineContainerFoodSpoilConfig Config { get; private set; } = NoOfflineContainerFoodSpoilConfig.CreateDefault();
         internal ICoreServerAPI? ServerApi { get; private set; }
+        internal HashSet<BlockEntityBehaviorOfflinePreserve> WasModifiedThisTick = [];
 
         public override void Start(ICoreAPI api)
         {
@@ -33,6 +34,13 @@ namespace NoOfflineContainerFoodSpoil
             LoadConfig(api);
             NoOfflineContainerFoodSpoilCommands.Register(this, api);
             api.Event.DidPlaceBlock += OnDidPlaceBlock;
+            api.Event.DidUseBlock += OnDidUseBlock;
+            api.Event.RegisterGameTickListener(_ => OnTick(), 1);
+        }
+
+        private void OnTick()
+        {
+            WasModifiedThisTick.Clear();
         }
 
         public override void AssetsFinalize(ICoreAPI api)
@@ -98,9 +106,19 @@ namespace NoOfflineContainerFoodSpoil
             behavior.SeedResident(player.PlayerUID);
             behavior.Init(container, ServerApi);
         }
+
+        private void OnDidUseBlock(IServerPlayer player, BlockSelection blockSel)
+        {
+            if (ServerApi is not { Side: EnumAppSide.Server }) return;
+            BlockEntity? blockEntity = ServerApi.World.BlockAccessor.GetBlockEntity(blockSel.Position);
+            if (blockEntity is not BlockEntityContainer) return;
+            BlockEntityBehaviorOfflinePreserve? behavior = blockEntity.GetBehavior<BlockEntityBehaviorOfflinePreserve>();
+            if (behavior == null || !WasModifiedThisTick.Remove(behavior)) return;
+            behavior.ProcessMeaningfulInteraction(player);
+        }
     }
 
-    public sealed class BlockEntityBehaviorOfflinePreserve : BlockEntityBehavior
+    public sealed class BlockEntityBehaviorOfflinePreserve(BlockEntity blockEntity) : BlockEntityBehavior(blockEntity)
     {
         private const double TrackingCacheWindowSeconds = 30;
         private const string TrackedUsersTreeKey = "TrackedUsersJson";
@@ -114,11 +132,7 @@ namespace NoOfflineContainerFoodSpoil
         private NoOfflineContainerFoodSpoilModSystem? modSys;
         private string? legacyOwnerUid;
 
-        public List<TrackedUserEntry> TrackedUsers { get; private set; } = new();
-
-        public BlockEntityBehaviorOfflinePreserve(BlockEntity blockEntity) : base(blockEntity)
-        {
-        }
+        private List<TrackedUserEntry> TrackedUsers { get; set; } = [];
 
         public override void ToTreeAttributes(ITreeAttribute tree)
         {
@@ -135,17 +149,17 @@ namespace NoOfflineContainerFoodSpoil
             string trackedUsersJson = tree.GetString(TrackedUsersTreeKey);
             if (string.IsNullOrWhiteSpace(trackedUsersJson))
             {
-                TrackedUsers = new List<TrackedUserEntry>();
+                TrackedUsers = [];
                 return;
             }
 
             try
             {
-                TrackedUsers = JsonConvert.DeserializeObject<List<TrackedUserEntry>>(trackedUsersJson) ?? new List<TrackedUserEntry>();
+                TrackedUsers = JsonConvert.DeserializeObject<List<TrackedUserEntry>>(trackedUsersJson) ?? [];
             }
             catch
             {
-                TrackedUsers = new List<TrackedUserEntry>();
+                TrackedUsers = [];
             }
         }
 
@@ -222,7 +236,8 @@ namespace NoOfflineContainerFoodSpoil
 
         private void OnSlotModified(int slotId)
         {
-            AttributeMeaningfulInteractionToOpenViewers();
+            if (AttributeMeaningfulInteractionToOpenViewers()) return;
+            modSys?.WasModifiedThisTick.Add(this);
         }
 
         private float OnAcquireTransitionSpeed(EnumTransitionType transType, ItemStack stack, float baseMul)
@@ -233,12 +248,12 @@ namespace NoOfflineContainerFoodSpoil
             return cachedHasOnlineTrackedUser ? baseMul : baseMul * cachedPerishMultiplier;
         }
 
-        private void AttributeMeaningfulInteractionToOpenViewers()
+        private bool AttributeMeaningfulInteractionToOpenViewers()
         {
             List<string> openViewerUids = GetOpenViewerUids();
             if (openViewerUids.Count == 0)
             {
-                return;
+                return false;
             }
 
             double now = GetUnixTimeSeconds();
@@ -247,6 +262,16 @@ namespace NoOfflineContainerFoodSpoil
                 ProcessMeaningfulInteraction(playerUid, now);
             }
 
+            MarkTrackingDirty();
+            RefreshTrackingCache(forcePersist: true);
+            return true;
+        }
+
+        public void ProcessMeaningfulInteraction(IPlayer player)
+        {
+            double now = GetUnixTimeSeconds();
+            ProcessMeaningfulInteraction(player.PlayerUID, now);
+            
             MarkTrackingDirty();
             RefreshTrackingCache(forcePersist: true);
         }
@@ -311,9 +336,8 @@ namespace NoOfflineContainerFoodSpoil
             TrackedUserEntry? pinnedResident = GetPinnedResident();
             List<TrackedUserEntry>? entriesToRemove = null;
 
-            for (int index = 0; index < TrackedUsers.Count; index++)
+            foreach (var entry in TrackedUsers)
             {
-                TrackedUserEntry entry = TrackedUsers[index];
                 RuntimeTrackedUserState state = EvaluateRuntimeState(entry, now, config);
 
                 if (state.RefreshResidentPresence)
@@ -346,7 +370,7 @@ namespace NoOfflineContainerFoodSpoil
             {
                 List<TrackedUserEntry> orderedEntries = TrackedUsers
                     .OrderBy(entry => entry.State == TrackedUserState.Resident ? 1 : 0)
-                    .ThenBy(entry => GetEntryReferenceTime(entry))
+                    .ThenBy(GetEntryReferenceTime)
                     .ToList();
 
                 while (orderedEntries.Count > config.TrackedPlayerLimit)
@@ -580,8 +604,8 @@ namespace NoOfflineContainerFoodSpoil
                 CountsForSpoilage = online && withinTimeWindow,
                 RemoveFromTracking = !withinTimeWindow,
                 Reason = online
-                    ? (withinTimeWindow ? "provisional-online-grace" : "provisional-expired")
-                    : (withinTimeWindow ? "provisional-offline-not-counting" : "provisional-expired")
+                    ? withinTimeWindow ? "provisional-online-grace" : "provisional-expired"
+                    : withinTimeWindow ? "provisional-offline-not-counting" : "provisional-expired"
             };
         }
 
