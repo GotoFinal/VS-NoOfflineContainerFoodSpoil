@@ -465,6 +465,9 @@ namespace NoOfflineContainerFoodSpoil
         private const string LastUnloadCheckpointUnixSecondsTreeKey = "LastUnloadCheckpointUnixSeconds";
         private const string LastUnloadCheckpointWorldHoursTreeKey = "LastUnloadCheckpointWorldHours";
         private const double PresencePersistIntervalSeconds = 300;
+        private const int InitialPendingCatchupDelayMs = 1;
+        private const int PendingCatchupRetryDelayMs = 50;
+        private const int MaxPendingCatchupInitAttempts = 10;
         private float cachedPerishMultiplier = 1f;
         private bool cachedHasOnlineTrackedUser;
         private double cachedNextRefreshUnixSeconds;
@@ -473,6 +476,8 @@ namespace NoOfflineContainerFoodSpoil
         private NoOfflineContainerFoodSpoilModSystem? modSys;
         private string? legacyOwnerUid;
         private bool isReconcilingPendingUnloadCatchup;
+        private bool pendingUnloadCatchupReconcileScheduled;
+        private int pendingUnloadCatchupInitAttempts;
 
         private List<TrackedUserEntry> TrackedUsers { get; set; } = [];
 
@@ -547,6 +552,7 @@ namespace NoOfflineContainerFoodSpoil
 
             modSys.RegisterLoadedContainer(this, container.Inventory);
             MigrateLegacyOwnerIfNeeded();
+            SchedulePendingUnloadCatchupReconcile(InitialPendingCatchupDelayMs, isInitRetry: true);
             RefreshTrackingCache(forcePersist: true);
             LogDebug($"Initialized. TrackedUsers={TrackedUsers.Count}, PendingUnloadCatchup={HasPendingUnloadCatchup}, LastUnloadCheckpoint={NoOfflineContainerFoodSpoilModSystem.FormatUnixSecondsForLog(LastUnloadCheckpointUnixSeconds)}, LastUnloadCheckpointWorldHours={LastUnloadCheckpointWorldHours:0.###}.");
         }
@@ -585,6 +591,8 @@ namespace NoOfflineContainerFoodSpoil
 
         private void OnInventoryOpened(IPlayer player)
         {
+            ReconcilePendingUnloadCatchupNow();
+
             TrackedUserEntry? entry = FindEntry(player.PlayerUID);
             if (entry?.State == TrackedUserState.Resident)
             {
@@ -890,6 +898,12 @@ namespace NoOfflineContainerFoodSpoil
                 return;
             }
 
+            if (!IsReadyForPendingUnloadCatchup(container))
+            {
+                LogDebug("Pending unload catch-up is still waiting for inventory contents to finish loading.");
+                return;
+            }
+
             double nowUnixSeconds = NoOfflineContainerFoodSpoilModSystem.GetUnixTimeSeconds();
             double nowWorldHours = world.Calendar.TotalHours;
             if (LastUnloadCheckpointUnixSeconds <= 0 || nowUnixSeconds <= LastUnloadCheckpointUnixSeconds || nowWorldHours <= LastUnloadCheckpointWorldHours)
@@ -917,6 +931,63 @@ namespace NoOfflineContainerFoodSpoil
             {
                 isReconcilingPendingUnloadCatchup = false;
             }
+        }
+
+        private void ReconcilePendingUnloadCatchupNow()
+        {
+            if (modSys?.ServerApi == null || TrackedUsers.Count == 0 || !HasPendingUnloadCatchup)
+            {
+                return;
+            }
+
+            TryReconcilePendingUnloadCatchup(modSys.ServerApi.World);
+        }
+
+        private void SchedulePendingUnloadCatchupReconcile(int delayMs, bool isInitRetry)
+        {
+            if (pendingUnloadCatchupReconcileScheduled || modSys?.ServerApi == null || TrackedUsers.Count == 0 || !HasPendingUnloadCatchup)
+            {
+                return;
+            }
+
+            pendingUnloadCatchupReconcileScheduled = true;
+            Blockentity.RegisterDelayedCallback(_ =>
+            {
+                pendingUnloadCatchupReconcileScheduled = false;
+
+                if (!HasPendingUnloadCatchup)
+                {
+                    pendingUnloadCatchupInitAttempts = 0;
+                    return;
+                }
+
+                TryReconcilePendingUnloadCatchup(modSys.ServerApi.World);
+                if (HasPendingUnloadCatchup && isInitRetry && pendingUnloadCatchupInitAttempts < MaxPendingCatchupInitAttempts)
+                {
+                    pendingUnloadCatchupInitAttempts++;
+                    LogDebug($"Retrying pending unload catch-up after delayed init attempt {pendingUnloadCatchupInitAttempts}/{MaxPendingCatchupInitAttempts}.");
+                    SchedulePendingUnloadCatchupReconcile(PendingCatchupRetryDelayMs, isInitRetry: true);
+                    return;
+                }
+
+                if (!HasPendingUnloadCatchup)
+                {
+                    pendingUnloadCatchupInitAttempts = 0;
+                }
+            }, delayMs);
+        }
+
+        private static bool IsReadyForPendingUnloadCatchup(BlockEntityContainer container)
+        {
+            foreach (ItemSlot slot in container.Inventory)
+            {
+                if (slot.Itemstack != null && slot.Itemstack.Collectible == null)
+                {
+                    return false;
+                }
+            }
+
+            return true;
         }
 
         private void ClearPendingUnloadCatchup(double nowUnixSeconds, double nowWorldHours)
@@ -1028,7 +1099,13 @@ namespace NoOfflineContainerFoodSpoil
             }
 
             ItemStack stack = slot.Itemstack!;
-            TransitionableProperties[]? transitionProps = stack.Collectible.GetTransitionableProperties(world, stack, null);
+            CollectibleObject? collectible = stack.Collectible;
+            if (collectible == null)
+            {
+                return;
+            }
+
+            TransitionableProperties[]? transitionProps = collectible.GetTransitionableProperties(world, stack, null);
             if (transitionProps == null || !TryGetPerishTransitionStateData(stack, transitionProps, out ITreeAttribute? attr, out float[]? transitionedHours, out int perishIndex))
             {
                 return;
@@ -1037,9 +1114,9 @@ namespace NoOfflineContainerFoodSpoil
             float previousTransitionedHours = transitionedHours![perishIndex];
             transitionedHours![perishIndex] += effectivePerishWorldHours;
             attr!.SetDouble("lastUpdatedTotalHours", world.Calendar.TotalHours);
-            LogDebug($"Applied catch-up to slot. Item={stack.Collectible.Code}, StackSize={stack.StackSize}, TransitionedHoursBefore={previousTransitionedHours:0.###}, AddedHours={effectivePerishWorldHours:0.###}, TransitionedHoursAfter={transitionedHours[perishIndex]:0.###}, LastUpdatedWorldHours={world.Calendar.TotalHours:0.###}.");
+            LogDebug($"Applied catch-up to slot. Item={collectible.Code}, StackSize={stack.StackSize}, TransitionedHoursBefore={previousTransitionedHours:0.###}, AddedHours={effectivePerishWorldHours:0.###}, TransitionedHoursAfter={transitionedHours[perishIndex]:0.###}, LastUpdatedWorldHours={world.Calendar.TotalHours:0.###}.");
 
-            stack.Collectible.UpdateAndGetTransitionState(world, slot, EnumTransitionType.Perish);
+            collectible.UpdateAndGetTransitionState(world, slot, EnumTransitionType.Perish);
         }
 
         private static bool TryGetPerishTransitionStateData(ItemStack stack, TransitionableProperties[] transitionProps, out ITreeAttribute? attr, out float[]? transitionedHours, out int perishIndex)
@@ -1073,7 +1150,7 @@ namespace NoOfflineContainerFoodSpoil
 
         private static bool HasPerishTransition(ItemSlot slot, IWorldAccessor world)
         {
-            if (slot.Itemstack == null)
+            if (world == null || slot?.Itemstack?.Collectible == null)
             {
                 return false;
             }
