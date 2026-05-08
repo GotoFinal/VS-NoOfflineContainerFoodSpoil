@@ -31,6 +31,7 @@ namespace NoOfflineContainerFoodSpoil
         private NoOfflineContainerFoodSpoilModSystem? modSys;
         private string? legacyOwnerUid;
         private bool isReconcilingPendingUnloadCatchup;
+        private bool suppressCustomTransitionSpeed;
         private bool pendingUnloadCatchupReconcileScheduled;
         private int pendingUnloadCatchupInitAttempts;
 
@@ -170,13 +171,13 @@ namespace NoOfflineContainerFoodSpoil
 
         private float OnAcquireTransitionSpeed(EnumTransitionType transType, ItemStack stack, float baseMul)
         {
-            if (transType != EnumTransitionType.Perish)
+            if (suppressCustomTransitionSpeed || transType != EnumTransitionType.Perish)
             {
-                return baseMul;
+                return 1f;
             }
 
             EnsureTrackingCacheCurrent();
-            return cachedHasOnlineTrackedUser ? baseMul : baseMul * cachedPerishMultiplier;
+            return cachedHasOnlineTrackedUser ? 1f : cachedPerishMultiplier;
         }
 
         private bool AttributeMeaningfulInteractionToOpenViewers()
@@ -417,6 +418,21 @@ namespace NoOfflineContainerFoodSpoil
         private static double GetEntryReferenceTime(TrackedUserEntry entry)
         {
             return Math.Max(entry.LastMeaningfulInteractionUnixSeconds, entry.LastResidentPresenceUnixSeconds);
+        }
+
+        private T RunWithoutCustomTransitionSpeed<T>(Func<T> action)
+        {
+            bool previousSuppressState = suppressCustomTransitionSpeed;
+            suppressCustomTransitionSpeed = true;
+
+            try
+            {
+                return action();
+            }
+            finally
+            {
+                suppressCustomTransitionSpeed = previousSuppressState;
+            }
         }
     }
 }

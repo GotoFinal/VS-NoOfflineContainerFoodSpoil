@@ -279,12 +279,19 @@ namespace NoOfflineContainerFoodSpoil
                 return;
             }
 
+            float transitionRateMul = GetTransitionRateMulWithoutCustomOverride(collectible, world, slot);
             float previousTransitionedHours = transitionedHours![perishIndex];
-            transitionedHours[perishIndex] += effectivePerishWorldHours;
+            float addedTransitionedHours = effectivePerishWorldHours * transitionRateMul;
+            transitionedHours[perishIndex] += addedTransitionedHours;
             attr!.SetDouble("lastUpdatedTotalHours", world.Calendar.TotalHours);
-            LogDebug($"Applied catch-up to slot. Item={collectible.Code}, StackSize={stack.StackSize}, TransitionedHoursBefore={previousTransitionedHours:0.###}, AddedHours={effectivePerishWorldHours:0.###}, TransitionedHoursAfter={transitionedHours[perishIndex]:0.###}, LastUpdatedWorldHours={world.Calendar.TotalHours:0.###}.");
+            LogDebug($"Applied catch-up to slot. Item={collectible.Code}, StackSize={stack.StackSize}, EffectiveWorldHours={effectivePerishWorldHours:0.###}, TransitionRateMul={transitionRateMul:0.###}, TransitionedHoursBefore={previousTransitionedHours:0.###}, AddedTransitionedHours={addedTransitionedHours:0.###}, TransitionedHoursAfter={transitionedHours[perishIndex]:0.###}, LastUpdatedWorldHours={world.Calendar.TotalHours:0.###}.");
 
-            collectible.UpdateAndGetTransitionState(world, slot, EnumTransitionType.Perish);
+            RunWithoutCustomTransitionSpeed(() => collectible.UpdateAndGetTransitionState(world, slot, EnumTransitionType.Perish));
+        }
+
+        private float GetTransitionRateMulWithoutCustomOverride(CollectibleObject collectible, IWorldAccessor world, ItemSlot slot)
+        {
+            return RunWithoutCustomTransitionSpeed(() => collectible.GetTransitionRateMul(world, slot, EnumTransitionType.Perish));
         }
 
         private static bool TryGetPerishTransitionStateData(ItemStack stack, TransitionableProperties[] transitionProps, out ITreeAttribute? attr, out float[]? transitionedHours, out int perishIndex)
