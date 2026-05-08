@@ -5,7 +5,7 @@ namespace NoOfflineContainerFoodSpoil
     public class NoOfflineContainerFoodSpoilConfig
     {
         // Enables verbose server logs for membership tracking, unload checkpoints and spoilage catch-up reconciliation.
-        public bool EnableDebugLogging = true;
+        public bool EnableDebugLogging = false;
         // Max number of players that are tracked for spoilage
         public int TrackedPlayerLimit = 5;
         // How quickly food spoils when a player is offline, 0 to just disable fully
