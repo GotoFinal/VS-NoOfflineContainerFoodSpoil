@@ -289,6 +289,7 @@ namespace NoOfflineContainerFoodSpoil
         {
             StringBuilder builder = new StringBuilder();
             builder.AppendLine("Config:");
+            builder.AppendLine($"  EnableDebugLogging={config.EnableDebugLogging}");
             builder.AppendLine($"  TrackedPlayerLimit={FormatInt(config.TrackedPlayerLimit)}");
             builder.AppendLine($"  OfflineSpoilageMultiplier={FormatFloat(config.OfflineSpoilageMultiplier)}");
             builder.AppendLine($"  ResidentExpiryRealDays={FormatDouble(config.ResidentExpiryRealDays)}");
@@ -308,6 +309,9 @@ namespace NoOfflineContainerFoodSpoil
 
             switch (NormalizeSettingName(setting))
             {
+                case "enabledebuglogging":
+                    value = $"EnableDebugLogging={config.EnableDebugLogging}";
+                    return true;
                 case "trackedplayerlimit":
                     value = $"TrackedPlayerLimit={FormatInt(config.TrackedPlayerLimit)}";
                     return true;
@@ -349,6 +353,17 @@ namespace NoOfflineContainerFoodSpoil
 
             switch (NormalizeSettingName(setting))
             {
+                case "enabledebuglogging":
+                    if (!bool.TryParse(rawValue, out bool enableDebugLogging))
+                    {
+                        error = $"Invalid boolean value for {setting}. Use true or false.";
+                        return false;
+                    }
+
+                    config.EnableDebugLogging = enableDebugLogging;
+                    canonicalName = nameof(config.EnableDebugLogging);
+                    formattedValue = config.EnableDebugLogging.ToString();
+                    return true;
                 case "trackedplayerlimit":
                     if (!int.TryParse(rawValue, NumberStyles.Integer, CultureInfo.InvariantCulture, out int trackedPlayerLimit))
                     {
@@ -431,7 +446,7 @@ namespace NoOfflineContainerFoodSpoil
 
         private static string GetSupportedSettingsSummary()
         {
-            return "TrackedPlayerLimit, OfflineSpoilageMultiplier, ResidentExpiryRealDays, ResidentKeepaliveRadiusBlocks, ProvisionalExpiryRealHours, PromotionWindowRealDays, FarAwayRadiusBlocks, FarAwayExpiryRealHours, SessionHistoryPruneRealDays";
+            return "EnableDebugLogging, TrackedPlayerLimit, OfflineSpoilageMultiplier, ResidentExpiryRealDays, ResidentKeepaliveRadiusBlocks, ProvisionalExpiryRealHours, PromotionWindowRealDays, FarAwayRadiusBlocks, FarAwayExpiryRealHours, SessionHistoryPruneRealDays";
         }
 
         private static string FormatInt(int value)
